@@ -1,0 +1,3 @@
+/target/
+*.profraw
+/editors/zed/.dev-extension/
