@@ -1,6 +1,8 @@
 use runlet::*;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 fn object(fields: Vec<(&str, Schema)>) -> Schema {
     let properties = fields
@@ -171,6 +173,11 @@ fn boundary_retry_reuses_successful_operations() {
     assert_eq!(execution.value, 3.into());
     assert_eq!(*stable_calls.lock().unwrap(), 1);
     assert_eq!(*flaky_calls.lock().unwrap(), 2);
+    assert!(execution
+        .graph
+        .edges
+        .iter()
+        .any(|edge| edge.kind == EdgeKind::RetryOf));
 }
 
 #[test]
@@ -199,6 +206,88 @@ fn conversions_and_short_circuiting_are_observable() {
         .nodes
         .iter()
         .any(|n| n.kind == NodeKind::Convert));
+}
+
+#[test]
+fn loop_limits_bound_parallel_execution_and_stream_graph_events() {
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(descriptor("slow", vec![Schema::INTEGER], Schema::INTEGER))
+        .unwrap();
+    let active = Arc::new(AtomicUsize::new(0));
+    let maximum = Arc::new(AtomicUsize::new(0));
+    let runtime = Runtime::builder()
+        .registry(registry)
+        .tool("slow", {
+            let active = active.clone();
+            let maximum = maximum.clone();
+            move |args, _| {
+                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                maximum.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(30));
+                active.fetch_sub(1, Ordering::SeqCst);
+                Ok(args[0].clone())
+            }
+        })
+        .build()
+        .unwrap();
+    let program = runtime
+        .compile("values = for x in [1, 2, 3, 4, 5, 6] limit 3 { return slow(x) }\nreturn values")
+        .unwrap();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let execution = runtime
+        .run_observed(&program, {
+            let events = events.clone();
+            move |event| events.lock().unwrap().push(event.clone())
+        })
+        .unwrap();
+
+    assert_eq!(
+        execution.value,
+        CanonicalValue::List((1..=6).map(CanonicalValue::Integer).collect())
+    );
+    assert_eq!(maximum.load(Ordering::SeqCst), 3);
+    let events = events.lock().unwrap();
+    assert!(events
+        .windows(2)
+        .all(|pair| pair[0].sequence < pair[1].sequence));
+    assert!(events.iter().any(|event| matches!(
+        event.change,
+        GraphChange::NodeUpdated(ref node) if node.state == NodeState::Running
+    )));
+}
+
+#[test]
+fn producer_consumer_edges_are_recorded_for_tool_chains() {
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(descriptor("step", vec![Schema::INTEGER], Schema::INTEGER))
+        .unwrap();
+    let runtime = Runtime::builder()
+        .registry(registry)
+        .tool("step", |args, _| Ok(args[0].clone()))
+        .build()
+        .unwrap();
+    let execution = runtime
+        .run(
+            &runtime
+                .compile("first = step(1)\nsecond = step(first)\nreturn second")
+                .unwrap(),
+        )
+        .unwrap();
+    let calls = execution
+        .graph
+        .nodes
+        .iter()
+        .filter(|node| node.kind == NodeKind::Call)
+        .collect::<Vec<_>>();
+    assert_eq!(calls.len(), 2);
+    assert!(execution.graph.edges.iter().any(|edge| {
+        calls.iter().any(|node| node.id == edge.from)
+            && calls.iter().any(|node| node.id == edge.to)
+            && edge.from != edge.to
+            && matches!(edge.kind, EdgeKind::Data { .. })
+    }));
 }
 
 struct VObj;

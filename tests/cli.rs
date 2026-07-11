@@ -21,6 +21,22 @@ fn runs_a_core_program_from_a_file() {
 }
 
 #[test]
+fn streams_graph_updates_in_graph_mode() {
+    let output = Command::new(env!("CARGO_BIN_EXE_runlet"))
+        .arg("graph")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/examples/02_operators.rnlt"
+        ))
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("succeeded"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("\"total\":57"));
+}
+
+#[test]
 fn reports_source_diagnostics_and_fails() {
     let path = std::env::temp_dir().join(format!("runlet-invalid-{}.rnlt", std::process::id()));
     fs::write(&path, "return missing_name\n").unwrap();

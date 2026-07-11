@@ -1,11 +1,12 @@
 use crate::analyzer::{compile, CompiledProgram, ExternalInput};
 use crate::{
-    BinaryOp, Block, CanonicalValue as V, Diagnostic, Expr, ExprKind, Graph, NodeKind, Schema,
-    Span, ToolRegistry, UnaryOp,
+    BinaryOp, Block, CanonicalValue as V, Diagnostic, Expr, ExprKind, Graph, GraphChange,
+    GraphEvent, NodeKind, NodeState, Schema, Span, ToolRegistry, UnaryOp,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
 #[derive(Debug, Clone)]
@@ -80,26 +81,43 @@ impl Runtime {
         compile(source, &self.registry, &inputs)
     }
     pub fn run(&self, program: &CompiledProgram) -> Result<Execution, ToolError> {
+        self.run_observed(program, |_| {})
+    }
+
+    /// Runs a program and reports graph changes from executor threads as they happen.
+    ///
+    /// Calls to `observer` are serialized and sequence numbers are strictly increasing.
+    pub fn run_observed<F>(
+        &self,
+        program: &CompiledProgram,
+        observer: F,
+    ) -> Result<Execution, ToolError>
+    where
+        F: Fn(&GraphEvent) + Send + Sync + 'static,
+    {
         if program.registry_digest != self.registry.digest() {
             return Err(ToolError::new(
                 "RL7102",
                 "compiled program registry digest does not match this runtime",
             ));
         }
+        let graph = Arc::new(LiveGraph::new(Arc::new(observer)));
         let mut ev = Evaluator {
             runtime: self,
-            graph: Graph::default(),
+            graph: graph.clone(),
             scopes: vec![],
             attempt: 0,
             owners: vec![],
             workflow: program.source_digest.clone(),
             dynamic: vec![],
-            successful_operations: HashMap::new(),
-            dispatch_generations: HashMap::new(),
+            successful_operations: Arc::new(Mutex::new(HashMap::new())),
+            dispatch_generations: Arc::new(Mutex::new(HashMap::new())),
+            operation_nodes: Arc::new(Mutex::new(HashMap::new())),
+            last_output: None,
         };
         let mut root = HashMap::new();
         for (n, (_, v)) in &self.inputs {
-            root.insert(n.clone(), Binding::Value(v.clone()));
+            root.insert(n.clone(), Binding::Value(v.clone(), None));
         }
         for s in &program.program.statements {
             root.insert(s.name.clone(), Binding::Expr(s.value.clone()));
@@ -111,10 +129,13 @@ impl Runtime {
         ev.graph.running(node);
         match ev.eval(&program.program.result) {
             Ok(v) => {
+                if let Some(producer) = ev.last_output {
+                    ev.graph.data(producer, node, "result", "return");
+                }
                 ev.graph.success(node, v.clone());
                 Ok(Execution {
                     value: v,
-                    graph: ev.graph,
+                    graph: graph.snapshot(),
                 })
             }
             Err(e) => {
@@ -173,23 +194,138 @@ pub struct Execution {
 #[derive(Clone)]
 enum Binding {
     Expr(Expr),
-    Value(V),
+    Value(V, Option<usize>),
     Evaluating,
 }
 struct Evaluator<'a> {
     runtime: &'a Runtime,
-    graph: Graph,
+    graph: Arc<LiveGraph>,
     scopes: Vec<HashMap<String, Binding>>,
     attempt: u32,
     owners: Vec<usize>,
     workflow: String,
     dynamic: Vec<String>,
-    successful_operations: HashMap<String, V>,
-    dispatch_generations: HashMap<String, u32>,
+    successful_operations: Arc<Mutex<HashMap<String, V>>>,
+    dispatch_generations: Arc<Mutex<HashMap<String, u32>>>,
+    operation_nodes: Arc<Mutex<HashMap<String, usize>>>,
+    last_output: Option<usize>,
+}
+
+struct LiveGraph {
+    state: Mutex<LiveGraphState>,
+    observer: Arc<dyn Fn(&GraphEvent) + Send + Sync>,
+}
+
+#[derive(Default)]
+struct LiveGraphState {
+    graph: Graph,
+    sequence: u64,
+}
+
+impl LiveGraph {
+    fn new(observer: Arc<dyn Fn(&GraphEvent) + Send + Sync>) -> Self {
+        Self {
+            state: Mutex::new(LiveGraphState::default()),
+            observer,
+        }
+    }
+
+    fn publish(&self, state: &mut LiveGraphState, change: GraphChange) {
+        state.sequence += 1;
+        (self.observer)(&GraphEvent {
+            sequence: state.sequence,
+            change,
+        });
+    }
+
+    fn begin(&self, kind: NodeKind, label: impl Into<String>, span: Span, attempt: u32) -> usize {
+        let mut state = self.state.lock().unwrap();
+        let index = state.graph.begin(kind, label, span, attempt);
+        let node = state.graph.nodes[index].clone();
+        self.publish(&mut state, GraphChange::NodeAdded(node));
+        index
+    }
+
+    fn update(&self, index: usize, apply: impl FnOnce(&mut Graph, usize)) {
+        let mut state = self.state.lock().unwrap();
+        apply(&mut state.graph, index);
+        let node = state.graph.nodes[index].clone();
+        self.publish(&mut state, GraphChange::NodeUpdated(node));
+    }
+
+    fn running(&self, index: usize) {
+        self.update(index, |graph, index| graph.running(index));
+    }
+
+    fn dispatching(&self, index: usize) {
+        self.update(index, |graph, index| {
+            graph.nodes[index].state = NodeState::Dispatching
+        });
+    }
+
+    fn label(&self, index: usize, label: String) {
+        self.update(index, |graph, index| graph.nodes[index].label = label);
+    }
+
+    fn blocked(&self, index: usize) {
+        self.update(index, |graph, index| {
+            graph.nodes[index].state = NodeState::Blocked
+        });
+    }
+
+    fn success(&self, index: usize, value: V) {
+        self.update(index, |graph, index| graph.success(index, value));
+    }
+
+    fn fail(&self, index: usize, error: impl Into<String>) {
+        let error = error.into();
+        self.update(index, |graph, index| graph.fail(index, error));
+    }
+
+    fn contains(&self, parent: usize, child: usize) {
+        let mut state = self.state.lock().unwrap();
+        state.graph.contains(parent, child);
+        let edge = state.graph.edges.last().unwrap().clone();
+        self.publish(&mut state, GraphChange::EdgeAdded(edge));
+    }
+
+    fn data(&self, producer: usize, consumer: usize, producer_path: &str, consumer_path: &str) {
+        let mut state = self.state.lock().unwrap();
+        let edge = crate::Edge {
+            from: state.graph.nodes[producer].id.clone(),
+            to: state.graph.nodes[consumer].id.clone(),
+            kind: crate::EdgeKind::Data {
+                producer_path: producer_path.into(),
+                consumer_path: consumer_path.into(),
+            },
+        };
+        state.graph.edges.push(edge.clone());
+        self.publish(&mut state, GraphChange::EdgeAdded(edge));
+    }
+
+    fn retry_of(&self, retry: usize, previous_attempt: usize) {
+        let mut state = self.state.lock().unwrap();
+        let edge = crate::Edge {
+            from: state.graph.nodes[retry].id.clone(),
+            to: state.graph.nodes[previous_attempt].id.clone(),
+            kind: crate::EdgeKind::RetryOf,
+        };
+        state.graph.edges.push(edge.clone());
+        self.publish(&mut state, GraphChange::EdgeAdded(edge));
+    }
+
+    fn node_id(&self, index: usize) -> String {
+        self.state.lock().unwrap().graph.nodes[index].id.clone()
+    }
+
+    fn snapshot(&self) -> Graph {
+        self.state.lock().unwrap().graph.clone()
+    }
 }
 
 impl Evaluator<'_> {
     fn eval(&mut self, e: &Expr) -> Result<V, ToolError> {
+        self.last_output = None;
         match &e.kind {
             ExprKind::Null => Ok(V::Null),
             ExprKind::Boolean(v) => Ok(V::Boolean(*v)),
@@ -298,8 +434,9 @@ impl Evaluator<'_> {
             .ok_or_else(|| lang("RL8101", &format!("unknown runtime name `{n}`")))?;
         let binding = self.scopes[found].remove(n).unwrap();
         match binding {
-            Binding::Value(v) => {
-                self.scopes[found].insert(n.into(), Binding::Value(v.clone()));
+            Binding::Value(v, producer) => {
+                self.last_output = producer;
+                self.scopes[found].insert(n.into(), Binding::Value(v.clone(), producer));
                 Ok(v)
             }
             Binding::Evaluating => Err(lang("RL4104", "internal binding cycle")),
@@ -308,7 +445,8 @@ impl Evaluator<'_> {
                 let r = self.eval(&e);
                 match &r {
                     Ok(v) => {
-                        self.scopes[found].insert(n.into(), Binding::Value(v.clone()));
+                        self.scopes[found]
+                            .insert(n.into(), Binding::Value(v.clone(), self.last_output));
                     }
                     Err(_) => {
                         self.scopes[found].insert(n.into(), Binding::Expr(e));
@@ -325,11 +463,17 @@ impl Evaluator<'_> {
             .registry
             .get(&name)
             .ok_or_else(|| lang("RL2102", &format!("unknown tool `{name}`")))?;
-        let node = self.node(NodeKind::Call, &name, span);
+        let node = self.blocked_node(NodeKind::Call, &name, span);
         let mut values = vec![];
-        for (a, expected) in args.iter().zip(&desc.input.parameters) {
+        for (index, (a, expected)) in args.iter().zip(&desc.input.parameters).enumerate() {
             match self.eval(a).and_then(|v| self.convert(a.span, v, expected)) {
-                Ok(v) => values.push(v),
+                Ok(v) => {
+                    if let Some(producer) = self.last_output {
+                        self.graph
+                            .data(producer, node, "output", &format!("argument[{index}]"));
+                    }
+                    values.push(v)
+                }
                 Err(e) => {
                     self.graph.fail(node, e.to_string());
                     return Err(e);
@@ -341,7 +485,11 @@ impl Evaluator<'_> {
             self.graph.fail(node, e.to_string());
             return Err(e);
         }
-        self.graph.nodes[node].state = crate::NodeState::Dispatching;
+        if let Some(V::String(display)) = values.first() {
+            let display = display.chars().take(80).collect::<String>();
+            self.graph.label(node, format!("{name} · {display}"));
+        }
+        self.graph.dispatching(node);
         let canonical = V::List(values.clone())
             .rcve()
             .map_err(|x| lang("RL5207", &x.to_string()))?;
@@ -354,14 +502,27 @@ impl Evaluator<'_> {
             self.dynamic.join("/")
         );
         let op = hex::encode(Sha256::digest([identity.as_bytes(), &canonical].concat()));
-        if let Some(value) = self.successful_operations.get(&op).cloned() {
+        if let Some(previous_attempt) = self
+            .operation_nodes
+            .lock()
+            .unwrap()
+            .insert(op.clone(), node)
+        {
+            self.graph.retry_of(node, previous_attempt);
+        }
+        let previous = self.successful_operations.lock().unwrap().get(&op).cloned();
+        if let Some(value) = previous {
             return self.finish(node, Ok(value));
         }
-        let generation = self.dispatch_generations.entry(op.clone()).or_default();
-        let dispatch_id = format!("{op}:{}", *generation);
-        *generation += 1;
+        let dispatch_id = {
+            let mut generations = self.dispatch_generations.lock().unwrap();
+            let generation = generations.entry(op.clone()).or_default();
+            let dispatch_id = format!("{op}:{}", *generation);
+            *generation += 1;
+            dispatch_id
+        };
         let ctx = ToolContext {
-            node_id: self.graph.nodes[node].id.clone(),
+            node_id: self.graph.node_id(node),
             operation_id: op.clone(),
             dispatch_id,
             attempt: self.attempt,
@@ -389,7 +550,10 @@ impl Evaluator<'_> {
             );
         }
         if let Ok(value) = &r {
-            self.successful_operations.insert(op, value.clone());
+            self.successful_operations
+                .lock()
+                .unwrap()
+                .insert(op, value.clone());
         }
         self.finish(node, r)
     }
@@ -460,28 +624,54 @@ impl Evaluator<'_> {
                 return Err(e);
             }
         };
+        let values = Arc::new(values);
+        let next = Arc::new(AtomicUsize::new(0));
+        let results = Arc::new(Mutex::new(vec![None; values.len()]));
+        let worker_count = (limit as usize).min(values.len());
+        let templates = (0..worker_count)
+            .map(|_| self.clone_for_branch())
+            .collect::<Vec<_>>();
+        std::thread::scope(|scope| {
+            for template in templates {
+                let values = values.clone();
+                let next = next.clone();
+                let results = results.clone();
+                scope.spawn(move || loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(value) = values.get(i).cloned() else {
+                        break;
+                    };
+                    let mut child = template.clone_for_branch();
+                    let it = child.node(
+                        NodeKind::Iteration,
+                        iteration_label(binding, i, &value),
+                        body.span,
+                    );
+                    child.graph.contains(node, it);
+                    child.owners.push(it);
+                    child
+                        .dynamic
+                        .push(format!("{i}:{}", value.digest_hex().unwrap_or_default()));
+                    child.scopes.push(HashMap::from([(
+                        binding.into(),
+                        Binding::Value(value, None),
+                    )]));
+                    let result = child.block(body);
+                    match &result {
+                        Ok(value) => child.graph.success(it, value.clone()),
+                        Err(error) => child.graph.fail(it, error.to_string()),
+                    }
+                    results.lock().unwrap()[i] = Some(result);
+                });
+            }
+        });
         let mut out = Vec::with_capacity(values.len());
-        for (i, v) in values.into_iter().enumerate() {
-            let it = self.node(NodeKind::Iteration, format!("iteration {i}"), body.span);
-            self.graph.contains(node, it);
-            self.owners.push(it);
-            self.dynamic
-                .push(format!("{i}:{}", v.digest_hex().unwrap_or_default()));
-            self.scopes
-                .push(HashMap::from([(binding.into(), Binding::Value(v))]));
-            let r = self.block(body);
-            self.scopes.pop();
-            self.dynamic.pop();
-            self.owners.pop();
-            match r {
-                Ok(v) => {
-                    self.graph.success(it, v.clone());
-                    out.push(v)
-                }
-                Err(e) => {
-                    self.graph.fail(it, e.to_string());
-                    self.graph.fail(node, e.to_string());
-                    return Err(e);
+        for result in results.lock().unwrap().iter_mut() {
+            match result.take().expect("every iteration produced a result") {
+                Ok(value) => out.push(value),
+                Err(error) => {
+                    self.graph.fail(node, error.to_string());
+                    return Err(error);
                 }
             }
         }
@@ -524,7 +714,7 @@ impl Evaluator<'_> {
         let error = error_value(&e, self.attempt);
         self.scopes.push(HashMap::from([(
             error_binding.into(),
-            Binding::Value(error),
+            Binding::Value(error, None),
         )]));
         self.owners.push(node);
         let r = self.block(catch);
@@ -551,13 +741,54 @@ impl Evaluator<'_> {
         }
         i
     }
+    fn blocked_node(&mut self, k: NodeKind, l: impl Into<String>, s: Span) -> usize {
+        let i = self.graph.begin(k, l, s, self.attempt);
+        self.graph.blocked(i);
+        if let Some(&parent) = self.owners.last() {
+            self.graph.contains(parent, i)
+        }
+        i
+    }
+    fn clone_for_branch(&self) -> Evaluator<'_> {
+        Evaluator {
+            runtime: self.runtime,
+            graph: self.graph.clone(),
+            scopes: self.scopes.clone(),
+            attempt: self.attempt,
+            owners: self.owners.clone(),
+            workflow: self.workflow.clone(),
+            dynamic: self.dynamic.clone(),
+            successful_operations: self.successful_operations.clone(),
+            dispatch_generations: self.dispatch_generations.clone(),
+            operation_nodes: self.operation_nodes.clone(),
+            last_output: self.last_output,
+        }
+    }
     fn finish(&mut self, node: usize, r: Result<V, ToolError>) -> Result<V, ToolError> {
         match &r {
-            Ok(v) => self.graph.success(node, v.clone()),
+            Ok(v) => {
+                self.graph.success(node, v.clone());
+                self.last_output = Some(node);
+            }
             Err(e) => self.graph.fail(node, e.to_string()),
         }
         r
     }
+}
+
+fn iteration_label(binding: &str, index: usize, value: &V) -> String {
+    let key = match value {
+        V::String(value) => Some(value.as_str()),
+        V::Object(fields) => fields.get("name").and_then(|value| match value {
+            V::String(value) => Some(value.as_str()),
+            _ => None,
+        }),
+        _ => None,
+    };
+    key.map_or_else(
+        || format!("{binding}[{index}]"),
+        |key| format!("{binding}[{index}] {key}"),
+    )
 }
 
 fn path(e: &Expr) -> Option<String> {

@@ -1,10 +1,9 @@
 # Runlet
 
-This repository contains the Phase 0 semantic executable model specified by
-[`DESIGN.md`](DESIGN.md). It is a deterministic, single-threaded Rust model of
-the language: parsing, structural schema analysis, canonical values, lazy
-root-reachable effects, dynamic branches and loops, error boundaries, and an
-inspectable execution graph.
+This repository contains the executable semantic model specified by
+[`DESIGN.md`](DESIGN.md): parsing, structural schema analysis, canonical values,
+lazy root-reachable effects, dynamic branches and bounded concurrent loops,
+error boundaries, and an inspectable real-time execution graph.
 
 ```rust
 use runlet::{CanonicalValue, ExecutionPolicy, Runtime, Schema, ToolDescriptor,
@@ -35,8 +34,8 @@ assert_eq!(execution.value, CanonicalValue::String("Hello, Runlet!".into()));
 ```
 
 Run `cargo test` for canonical encoding fixtures and executable semantic
-examples. Async scheduling, journals, recovery, and production executors are
-explicitly Phase 1–3 work in the design and are not claimed by this crate.
+examples. Loop iterations use a local threaded executor; durable journals,
+recovery, cancellation, and production executors remain later-phase work.
 
 ## Language demos
 
@@ -56,6 +55,34 @@ After installing the binary with `cargo install --path .`, the same command is:
 ```sh
 runlet ./examples/03_loops.rnlt
 ```
+
+### Live concurrent graph demo
+
+[`examples/live/pipeline.rnlt`](examples/live/pipeline.rnlt) models a
+multi-region ingestion pipeline with nested fan-out, deep dependency chains,
+bounded concurrency, and fan-in stages. `demo.task(label, milliseconds, input)`
+is a CLI-provided tool that simulates long-running host work while preserving
+its input in the output envelope.
+
+Watch the execution graph change while the pipeline runs:
+
+```sh
+cargo run -- graph ./examples/live/pipeline.rnlt
+```
+
+Runlet infers all scheduling from value dependencies. The outer `limit 3`
+allows three region subgraphs to run concurrently; each region's inner
+`limit 3` allows its three source chains to overlap. Per-source error boundaries
+make retries explicit: every `orders` enrichment recovers on its second attempt,
+while `sa-east/events` exhausts three attempts and follows the visible fallback
+path. Results retain source order even when individual tasks finish out of
+order. The full demo takes roughly half a minute, leaving time to follow each
+transition in the dashboard.
+
+The dashboard groups work by named `region › source` hierarchy. Separate
+sections show active calls with elapsed time, currently materialized boundaries
+and attempt counts, explicit failure/retry/recovery/catch events, and the latest
+producer-to-consumer data-flow edges.
 
 ## Editor support
 

@@ -1,8 +1,8 @@
-//! Runlet's Phase 0 semantic executable model.
+//! Runlet's executable semantic model.
 //!
-//! The crate deliberately keeps execution deterministic and single-threaded. It
-//! implements the complete language surface while leaving durable journals and
-//! real asynchronous executors to the later phases described in `DESIGN.md`.
+//! The runtime keeps deterministic values and ordered results while allowing
+//! bounded loop subgraphs to execute concurrently. Durable journals and remote
+//! production executors remain later phases described in `DESIGN.md`.
 
 mod analyzer;
 mod diagnostic;
@@ -16,7 +16,7 @@ mod value;
 
 pub use analyzer::{compile, CompiledProgram, ExternalInput};
 pub use diagnostic::{Diagnostic, Fix, Phase, Severity, Span};
-pub use graph::{Edge, EdgeKind, Graph, Node, NodeKind, NodeState};
+pub use graph::{Edge, EdgeKind, Graph, GraphChange, GraphEvent, Node, NodeKind, NodeState};
 pub use parser::parse;
 pub use runtime::{Execution, Runtime, RuntimeBuilder, ToolContext, ToolError};
 pub use schema::{CallSchema, ExecutionPolicy, Property, Schema, ToolDescriptor, ToolRegistry};

@@ -72,6 +72,21 @@ pub struct Graph {
     pub edges: Vec<Edge>,
 }
 
+/// An ordered, incremental change to a running execution graph.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GraphEvent {
+    pub sequence: u64,
+    pub change: GraphChange,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+pub enum GraphChange {
+    NodeAdded(Node),
+    NodeUpdated(Node),
+    EdgeAdded(Edge),
+}
+
 impl Graph {
     pub(crate) fn begin(
         &mut self,
