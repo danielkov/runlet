@@ -49,6 +49,15 @@ fn vscode_extension_registers_the_complete_runlet_grammar() {
 
 #[test]
 fn zed_and_vim_support_runlet_files() {
+    let extension = fs::read_to_string("editors/zed/extension.toml").unwrap();
+    assert!(extension.contains("repository = \"https://github.com/danielkov/runlet\""));
+    let revision = extension
+        .lines()
+        .find_map(|line| line.strip_prefix("rev = \"")?.strip_suffix('"'))
+        .expect("Zed grammar revision");
+    assert_eq!(revision.len(), 40);
+    assert!(revision.bytes().all(|byte| byte.is_ascii_hexdigit()));
+
     let zed = fs::read_to_string("editors/zed/languages/runlet/config.toml").unwrap();
     assert!(zed.contains("grammar = \"runlet\""));
     assert!(zed.contains("path_suffixes = [\"rnlt\"]"));
