@@ -1,109 +1,258 @@
 # Runlet
 
-This repository contains the executable semantic model specified by
-[`DESIGN.md`](DESIGN.md): parsing, structural schema analysis, canonical values,
-lazy root-reachable effects, dynamic branches and bounded concurrent loops,
-error boundaries, and an inspectable real-time execution graph.
+Runlet is a small orchestration language for LLM agents. It lets an agent
+replace a sequence of individual tool calls with one program that the host can
+check, execute concurrently, observe, and return as a single structured
+result.
 
-```rust
-use runlet::{CanonicalValue, ExecutionPolicy, Runtime, Schema, ToolDescriptor,
-             ToolRegistry, CallSchema};
+```runlet
+issues = linear.search_issues({ assignee: user, state: "open" })
+pulls = github.search_pull_requests({ author: user, state: "open" })
 
-let mut registry = ToolRegistry::new();
-registry.register(ToolDescriptor {
-    name: "hello".into(),
-    summary: "Return a greeting".into(),
-    input: CallSchema::positional(vec![Schema::string()]),
-    output: Schema::string(),
-    execution: ExecutionPolicy::Pure,
-    schema_version: "1".into(),
-})?;
+pulls_with_checks = for pull in pulls limit 8 {
+    checks = github.checks(pull.number)
+    return {
+        number: pull.number,
+        title: pull.title,
+        checks
+    }
+}
 
-let runtime = Runtime::builder()
-    .registry(registry)
-    .tool("hello", |args, _context| {
-        let CanonicalValue::String(name) = &args[0] else { unreachable!() };
-        Ok(CanonicalValue::String(format!("Hello, {name}!")))
-    })
-    .build()?;
-
-let program = runtime.compile("return hello(\"Runlet\")")?;
-let execution = runtime.run(&program)?;
-assert_eq!(execution.value, CanonicalValue::String("Hello, Runlet!".into()));
-# Ok::<(), Box<dyn std::error::Error>>(())
+return {
+    issues,
+    pull_requests: pulls_with_checks
+}
 ```
 
-Run `cargo test` for canonical encoding fixtures and executable semantic
-examples. Loop iterations use a local threaded executor; durable journals,
-recovery, cancellation, and production executors remain later-phase work.
+There is no `async` or `await`. References create data dependencies: the
+Linear and GitHub searches can start together, each checks lookup starts when
+its pull request is available, and `limit 8` bounds the fan-out. Only work that
+contributes to the returned value runs.
 
-## Language demos
+## Why a language for tool composition?
 
-The [`examples/`](examples/) directory contains `.rnlt` programs that run with
-an empty tool registry. They demonstrate values, operators, projections,
-conditionals, bounded loops, and catchable compute failures using only the core
-language.
+A conventional agent loop sends every tool result back through the model. For
+a multi-step task, that means repeated inference round-trips, a growing
+transcript full of intermediate data, and asking the model to manually carry
+state between calls.
 
-Run one with the CLI:
+Runlet moves that mechanical work into the agent runtime:
+
+```text
+model → one Runlet program → many host tool calls → one structured result
+```
+
+The model still decides what should happen. Runlet gives that decision a
+small, purpose-built execution format instead of making the model supervise
+every iteration, dependency, retry, and join.
+
+This is especially useful for:
+
+- list-then-detail and other N+1 API access patterns;
+- joining, projecting, and enriching structured results;
+- independent calls that should run concurrently;
+- bounded fan-out across many records;
+- read/transform/write workflows;
+- retryable operations with an explicit fallback; and
+- joining data from built-in tools, MCP servers, and application APIs.
+
+The motivation is borne out by AgentKit's
+[`compose` case study](https://github.com/danielkov/agentkit/blob/main/docs/compose-case-study.md).
+Its sandboxed Lua composition tool reduced model round-trips, context growth,
+and cost for tool-heavy tasks. On the study's initial six-scenario run,
+composition reduced cost by 38–77% while maintaining or improving accuracy.
+The broader model sweep also found an important boundary: composition was
+consistently valuable for N+1 fan-out, but could be counterproductive for
+exploratory investigations. Runlet targets the same runtime-enrichment
+mechanism with schemas, implicit dataflow, structured concurrency, and an
+inspectable execution graph built into the language.
+
+## Design goals
+
+| Goal | How Runlet approaches it |
+| --- | --- |
+| Make correct concurrency the default | Tool outputs behave like ordinary values; references create graph edges and independent nodes can run together. |
+| Keep programs easy for models to produce | The language has bindings, expressions, objects, lists, `for`, conditionals, boundaries, and `return`—but no imports, classes, functions, threads, or visible type syntax. |
+| Catch mistakes before tools run | The host registers every tool with input and output schemas. The analyzer checks names, calls, projections, operators, branches, and returned values. |
+| Avoid accidental effects | Execution is lazy and root-reachable. An unused tool call is rejected rather than silently dispatched. |
+| Bound dynamic work | `for ... limit N` caps active iterations while preserving result order. |
+| Make failure handling explicit | `boundary retry N { ... } catch err { ... }` owns a subgraph, retries retryable failures, and produces a normal fallback value. |
+| Let hosts retain control | The embedder supplies the complete tool registry, implementations, schemas, execution policies, and external inputs. |
+| Make execution observable | The runtime emits ordered graph events for nodes, dependencies, attempts, failures, recoveries, and results. |
+
+## Language tour
+
+Runlet programs are immutable expressions ending in one `return`:
+
+```runlet
+customer = crm.get_customer(customer_id)
+orders = commerce.list_orders({ customer_id: customer.id })
+
+enriched = for order in orders limit 12 {
+    result = boundary retry 2 {
+        return risk.score({ customer, order })
+    } catch err {
+        return {
+            status: "unavailable",
+            code: err.code,
+            attempt: err.attempt
+        }
+    }
+
+    return {
+        id: order.id,
+        total: order.total,
+        risk: result
+    }
+}
+
+return {
+    customer: customer.name,
+    orders: enriched
+}
+```
+
+The main rules are deliberately compact:
+
+- Assignments create immutable bindings.
+- A program and every block end with `return`.
+- Objects and lists are ordinary structured values.
+- `value if condition else alternative` evaluates only the selected branch.
+- `for item in items limit N { ... }` returns an ordered list.
+- `boundary retry N { ... } catch err { ... }` turns a failed subgraph into a
+  fallback value.
+- Tool namespaces such as `crm.get_customer` come entirely from the host.
+
+See [`examples/`](examples/) for executable programs and
+[`DESIGN.md`](DESIGN.md) for the complete language and runtime semantics.
+
+## Embedding Runlet
+
+The Rust crate provides the parser, analyzer, schemas, canonical values,
+runtime, and execution graph. A host describes its tool surface, connects each
+descriptor to an implementation, compiles agent-produced source, and executes
+the resulting program:
+
+```rust
+use runlet::{
+    CallSchema, CanonicalValue, ExecutionPolicy, Runtime, Schema,
+    ToolDescriptor, ToolRegistry,
+};
+
+fn main() {
+    let mut tools = ToolRegistry::new();
+    tools.register(ToolDescriptor {
+        name: "profile.lookup".into(),
+        summary: "Look up a user profile".into(),
+        input: CallSchema::positional(vec![Schema::string()]),
+        output: Schema::Any,
+        execution: ExecutionPolicy::Pure,
+        schema_version: "1".into(),
+    }).unwrap();
+
+    let runtime = Runtime::builder()
+        .registry(tools)
+        .input("user_id", Schema::string(), "usr_123".into())
+        .tool("profile.lookup", |args, _context| {
+            let CanonicalValue::String(id) = &args[0] else { unreachable!() };
+            Ok(CanonicalValue::Object([
+                ("id".into(), id.clone().into()),
+                ("name".into(), "Ada".into()),
+            ].into()))
+        })
+        .build()
+        .unwrap();
+
+    let program = runtime.compile(
+        "profile = profile.lookup(user_id)\nreturn profile"
+    ).unwrap();
+    let execution = runtime.run(&program).unwrap();
+
+    println!("{}", execution.value.presentation_json().unwrap());
+}
+```
+
+Tool handlers also receive stable operation, dispatch, schema-version, and
+attempt context. `run_observed` exposes the live graph event stream for logs,
+traces, dashboards, or an agent UI.
+
+## Enriching an AgentKit runtime
+
+[AgentKit](https://github.com/danielkov/agentkit) provides the surrounding
+agent loop, model adapters, tools, permissions, MCP integration, reporting,
+compaction, and task management. Runlet is intended to sit at the composition
+boundary of that runtime:
+
+1. Adapt the AgentKit tool catalog into Runlet `ToolDescriptor`s.
+2. Expose a `runlet` composition tool to the model alongside the granular
+   tools.
+3. Compile the submitted program against the tools visible for that turn.
+4. Dispatch Runlet call nodes through AgentKit's existing executor so
+   permissions, approvals, cancellation, and reporting remain authoritative.
+5. Return only the program's final structured value to the model transcript.
+
+That integration is not part of this repository yet; the current crate
+provides the executable language model and an in-process threaded executor.
+The separation is intentional: Runlet plans and explains the work, while the
+agent host owns capabilities and policy.
+
+### Compact results with TOON
+
+Tool composition prevents intermediate results from filling the transcript.
+The final result can be made smaller too. The
+[`serde_toon2`](https://docs.rs/serde_toon2/latest/serde_toon2/) crate provides
+Serde-compatible Token-Oriented Object Notation, so a host can encode the
+structured Runlet result before adding it to the next model turn:
+
+```rust
+let json = execution.value.presentation_json()?;
+let value: serde_json::Value = serde_json::from_str(&json)?;
+let model_context = serde_toon2::to_string(&value)?;
+```
+
+Together, the three projects cover distinct layers of the enrichment story:
+
+- AgentKit runs the model loop and governs tools.
+- Runlet composes tool work into a checked execution graph.
+- `serde_toon2` encodes the selected result for efficient model context.
+
+## Run the project
+
+Run the language examples with the built-in CLI:
 
 ```sh
 cargo run -- ./examples/03_loops.rnlt
+cargo run -- ./examples/05_boundaries.rnlt
 ```
 
-After installing the binary with `cargo install --path .`, the same command is:
-
-```sh
-runlet ./examples/03_loops.rnlt
-```
-
-### Live concurrent graph demo
-
-[`examples/live/pipeline.rnlt`](examples/live/pipeline.rnlt) models a
-multi-region ingestion pipeline with nested fan-out, deep dependency chains,
-bounded concurrency, and fan-in stages. `demo.task(label, milliseconds, input)`
-is a CLI-provided tool that simulates long-running host work while preserving
-its input in the output envelope.
-
-Watch the execution graph change while the pipeline runs:
+Watch a larger concurrent pipeline as a live execution graph:
 
 ```sh
 cargo run -- graph ./examples/live/pipeline.rnlt
 ```
 
-Runlet infers all scheduling from value dependencies. The outer `limit 3`
-allows three region subgraphs to run concurrently; each region's inner
-`limit 3` allows its three source chains to overlap. Per-source error boundaries
-make retries explicit: every `orders` enrichment recovers on its second attempt,
-while `sa-east/events` exhausts three attempts and follows the visible fallback
-path. Results retain source order even when individual tasks finish out of
-order. The full demo takes roughly half a minute, leaving time to follow each
-transition in the dashboard.
+Run the test suite:
 
-The dashboard groups work by named `region › source` hierarchy. Separate
-sections show active calls with elapsed time, currently materialized boundaries
-and attempt counts, explicit failure/retry/recovery/catch events, and the latest
-producer-to-consumer data-flow edges.
+```sh
+cargo test
+```
+
+The current implementation includes parsing, schema analysis, canonical
+values, lazy root-reachable execution, dynamic branches, bounded concurrent
+loops, retry boundaries, and live graph events. Durable journals, recovery,
+cancellation, and production executor interfaces remain roadmap work described
+in [`DESIGN.md`](DESIGN.md).
 
 ## Editor support
 
-The dependency-free VS Code extension in [`editors/vscode`](editors/vscode/)
-recognizes `.rnlt` files and provides syntax highlighting, comments, bracket
-matching, automatic closing pairs, and folding. Build and install it locally
-with:
+- [`editors/vscode`](editors/vscode/) provides a dependency-free VS Code
+  extension and reusable TextMate grammar.
+- [`editors/zed`](editors/zed/) provides a Zed extension backed by Tree-sitter.
+- [`editors/vim`](editors/vim/) provides Vim and Neovim syntax support.
+- [`editors/tree-sitter-runlet`](editors/tree-sitter-runlet/) contains the
+  Tree-sitter grammar source; generated parser files live only on the
+  `tree-sitter` branch.
 
-```sh
-(cd editors/vscode && npx --yes @vscode/vsce package \
-  --out ../../runlet-language.vsix --allow-missing-repository --skip-license)
-code --install-extension runlet-language.vsix
-```
+## License
 
-Its TextMate grammar lives at
-[`editors/vscode/syntaxes/runlet.tmLanguage.json`](editors/vscode/syntaxes/runlet.tmLanguage.json)
-and can be reused by other TextMate-compatible editors.
-
-Native integrations are also available for
-[`Zed`](editors/zed/README.md) and [`Vim/Neovim`](editors/vim/README.md).
-Zed uses the Runlet Tree-sitter grammar in
-[`editors/tree-sitter-runlet`](editors/tree-sitter-runlet/), while Vim ships a
-traditional runtime syntax file. Each editor directory includes local install
-instructions.
+Runlet is available under the MIT or Apache-2.0 license.
