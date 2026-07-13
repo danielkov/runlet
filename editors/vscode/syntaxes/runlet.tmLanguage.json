@@ -75,7 +75,7 @@
     },
     "keywords": {
       "name": "keyword.control.runlet",
-      "match": "\\b(?:return|for|in|limit|boundary|retry|catch|if|else)\\b"
+      "match": "\\b(?:return|for|in|limit|boundary|retry|catch|if|else|fold|skip|fail)\\b"
     },
     "word-operators": {
       "name": "keyword.operator.logical.runlet",
@@ -88,7 +88,7 @@
       }
     },
     "calls": {
-      "match": "([\\p{L}_][\\p{L}\\p{N}\\p{M}_]*(?:\\s*\\.\\s*[\\p{L}_][\\p{L}\\p{N}\\p{M}_]*)*)(?=\\s*\\()",
+      "match": "(?!fail\\b)([\\p{L}_][\\p{L}\\p{N}\\p{M}_]*(?:\\s*\\.\\s*[\\p{L}_][\\p{L}\\p{N}\\p{M}_]*)*)(?=\\s*\\()",
       "captures": {
         "1": { "name": "entity.name.function.runlet" }
       }

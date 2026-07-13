@@ -11,7 +11,7 @@ syntax match runletEscape /\\\%(["\\\/bfnrt]\|u[0-9A-Fa-f]\{4}\)/ contained
 syntax match runletNumber /\<\d\+\%([eE][+-]\=\d\+\)\>/
 syntax match runletNumber /\<\d\+\.\d\+\%([eE][+-]\=\d\+\)\=/
 
-syntax keyword runletKeyword return for in limit boundary retry catch if else
+syntax keyword runletKeyword return for in limit boundary retry catch if else fold skip fail
 syntax keyword runletOperator and or not
 syntax keyword runletBoolean true false
 syntax keyword runletConstant null

@@ -61,24 +61,30 @@ Numbers do not silently lose precision. Integer literals are arbitrary precision
 
 ### 2.2 Core grammar
 
-The following EBNF is normative for the version 1 surface grammar. Whitespace, comments, and statement terminators are elided. There are deliberately no effectful expression statements, statement-form control structures, or early returns: every binding in a block must contribute, directly or indirectly, to that block's final `return` to execute.
+The following EBNF is normative for the version 1 surface grammar. Whitespace, comments, and statement terminators are elided. There are deliberately no effectful expression statements, statement-form control structures, or early returns. `skip` is the one non-binding statement: it is loop-body control (section 2.7.1), not an expression.
 
 ```ebnf
 program       = let_stmt* , return_stmt ;
 
 let_stmt      = IDENT , "=" , expression ;
+skip_stmt     = "skip" , ( "if" , conditional_or )? ;   (* for/fold bodies only *)
 return_stmt   = "return" , expression ;
 
+if_expr       = "if" , expression , block_return ,
+                ( "else" , ( if_expr | block_return ) )? ;
 for_expr      = "for" , IDENT , "in" , expression ,
                 ( "limit" , INTEGER )? , block_return ;
+fold_expr     = "fold" , IDENT , "=" , expression ,
+                "for" , IDENT , "in" , expression , block_return ;
+fail_expr     = "fail" , "(" , arguments , ")" ;
 
 boundary_expr = "boundary" , retry_clause? , block_return , catch_clause_return ;
 retry_clause  = "retry" , INTEGER ;
 catch_clause_return = "catch" , IDENT , block_return ;
-block_return  = "{" , let_stmt* , return_stmt , "}" ;
+block_return  = "{" , ( let_stmt | skip_stmt )* , return_stmt , "}" ;
 
 expression    = conditional_or ,
-                ( "if" , conditional_or , "else" , expression )? ;
+                ( "if" , conditional_or , ( "else" , expression )? )? ;
 conditional_or = conditional_and , ( "or" , conditional_and )* ;
 conditional_and = equality , ( "and" , equality )* ;
 equality      = comparison , ( ( "==" | "!=" ) , comparison )* ;
@@ -92,19 +98,22 @@ index         = "[" , expression , "]" ;
 call          = "(" , arguments? , ")" ;
 arguments     = expression , ( "," , expression )* , ","? ;
 primary       = literal | IDENT | list | object | "(" , expression , ")"
-              | for_expr | boundary_expr ;
+              | if_expr | for_expr | fold_expr | fail_expr | boundary_expr ;
 literal       = "null" | "true" | "false" | INTEGER | NUMBER | STRING ;
 list          = "[" , ( expression , ( "," , expression )* , ","? )? , "]" ;
 object        = "{" , ( object_item , ( "," , object_item )* , ","? )? , "}" ;
 object_item   = ( FIELD_NAME | STRING ) , ":" , expression
+              | "[" , expression , "]" , ":" , expression
               | IDENT ;
 ```
 
 `FIELD_NAME` is an `IDENT` or any reserved word. Reserved words are not allowed by the object shorthand arm because no binding can have that name.
 
+`{ [expression]: value }` computes a property key at runtime. The key expression must produce a String or a scalar (Integer, Number, Boolean); scalars convert to their canonical text form, so `{ [user.id]: user }` keys by `"42"`. Any other kind is `RL2315` when statically known and the catchable `RL5209` otherwise. When keys collide — computed or mixed with static — the last entry wins, matching `+` merge's right bias; repeating the same *static* key stays the compile error `RL2203` because writing it twice is always a mistake. A literal containing a computed key has map schema (its keys are unknowable statically) over the union of every entry's value schema. Computed keys plus `fold` express keyed accumulation — grouping, indexing, counting by key — without dedicated intrinsics: `fold acc = {} for u in users { return acc + { [u.id]: u } }`.
+
 `{ customer, orders }` is shorthand for `{ customer: customer, orders: orders }`. Blocks and object literals are syntactically distinguishable from context. Assignment is declaration, not mutation: a name may be declared only once in a lexical scope. An inner scope may shadow an outer local name; a linter warns because accidental shadowing is usually harmful in generated programs. Registry root names are reserved in every scope: if `crm.customer` is registered, `crm = value` is a compile error with a rename fix. This makes callable-path resolution stable across local edits; a newly constructed progressive-disclosure registry can reject a previously valid source with a diagnostic naming the colliding root and registry digest.
 
-The parser accepts a final expression only through `return`; implicit final-expression and early returns are intentionally omitted so missing or ambiguous output is diagnosed clearly. In recovery mode, familiar statement-form `if`, `for`, `boundary`, and standalone calls receive one construct-level diagnostic and a machine fix toward the corresponding expression/binding form rather than cascades of reachability errors.
+The parser accepts a final expression only through `return`; implicit final-expression and early returns are intentionally omitted so missing or ambiguous output is diagnosed clearly. In recovery mode, familiar statement-form `if`, `for`, `boundary`, and standalone calls receive one construct-level diagnostic and a machine fix toward the corresponding expression/binding form rather than cascades of reachability errors. The `heal` pre-pass builds on those machine fixes: it applies safe, insertion-only repairs (missing `return`s, unbound statements, missing separators), re-parses, and hands hosts a healed source plus notes — an embedder can execute the repaired program and surface the notes as warnings instead of costing the model a retry.
 
 ### 2.3 Calls and namespaces
 
@@ -143,7 +152,7 @@ Operators use the schema-directed conversions in section 3.3 only after selectin
 | Operator | Accepted operands | Result and failures |
 |---|---|---|
 | unary `-` | Integer or Number | Same numeric type; checked `RL5101 NUMERIC_OVERFLOW` |
-| `+` | Integer×Integer; numeric pair; String×String; List×List | Checked Integer; Number after safe widening; concatenated String; ordered list with union element schema |
+| `+` | Integer×Integer; numeric pair; String×String; List×List; Object/Map×Object/Map | Checked Integer; Number after safe widening; concatenated String; ordered list with union element schema; shallow right-biased merge |
 | `-`, `*` | Integer×Integer or numeric pair | Checked Integer or Number after safe widening |
 | `/` | Numeric pair | Number; `RL5102 DIVISION_BY_ZERO`; each Integer must be exactly representable before widening |
 | `%` | Integer×Integer | Integer with quotient truncated toward zero and remainder having the dividend's sign; zero divisor is `RL5102` |
@@ -154,6 +163,8 @@ Operators use the schema-directed conversions in section 3.3 only after selectin
 | `and`, `or` | Boolean×Boolean | Boolean with short-circuit dynamic expansion |
 
 String concatenation provides a typed String context, so `"count: " + 3` uses canonical Integer-to-String conversion. Two operands for which multiple overload families would require equal-ranked conversions fail rather than guess. List concatenation never converts elements: `[1] + ["a"]` has element schema `Integer | String`.
+
+Object merge is shallow and right-biased: `defaults + overrides` keeps every key of both sides and the right side's value wins on collision. Two literal objects merge to the exact combined object schema; when either side is a map, the result is a map over the union of both sides' value schemas. Deep merge is deliberately absent — recursion depth and list-versus-replace semantics are not resolvable by intuition, and explicit nesting (`base + { nested: base.nested + patch }`) states them.
 
 All Integer arithmetic is checked i64 arithmetic. Literal-only overflow is a compile error; overflow involving runtime data is a catchable compute failure. Number operations use correctly rounded IEEE-754 binary64, but any non-finite result fails as `RL5103 NON_FINITE_NUMBER`. Operators are deterministic compute/branch nodes when any operand is unresolved.
 
@@ -172,35 +183,44 @@ Indexing has these exact domains and results:
 
 For list, string, and bytes targets, a negative index is normalized as `length + index`, matching Python/Starlark (`-1` is the last element). A normalized index outside the half-open interval `[0, length)` fails with `RL5205 INDEX_OUT_OF_BOUNDS`; the error contains original/normalized index and length. A missing object/map key fails with `RL5206 KEY_NOT_FOUND` and closest keys, never returns implicit null. A statically known invalid target/index pair, missing literal property, or out-of-range literal index into a literal value is a compile error with the same explanation and an edit where possible. Runtime projection failures are catchable according to lexical boundary ownership.
 
-Dot projection is equivalent to indexing by that literal field name after schema checking, except registry callable-path resolution takes precedence under section 2.3. Optional properties retain their nullable/optional schema when present in every variant; absence of an optional property at runtime is `RL5206`, so callers must use `object.get` when they want a default instead of a failure. Integer and String index contexts use the conversion ranks in section 3.3 only when a unique target row is statically selected.
+Dot projection is equivalent to indexing by that literal field name after schema checking, except registry callable-path resolution takes precedence under section 2.3. Optional properties retain their nullable/optional schema when present in every variant; absence of an optional property at runtime is `RL5206`, so callers guard with membership when they want a default instead of a failure: `obj[key] if key in obj else fallback` (the conditional is lazy, so the missing-key projection never evaluates). Integer and String index contexts use the conversion ranks in section 3.3 only when a unique target row is statically selected.
 
 ### 2.5 Reachability and execution
 
-Runlet is lazy with respect to effects. Only tool and compute nodes transitively reachable from the program's returned value are eligible to run. This gives `return waits only for values it references` a precise meaning and prevents accidental fire-and-forget side effects.
+Runlet is lazy with respect to pure work and eager with respect to declared effects. Pure tool and compute nodes are eligible to run only when transitively reachable from the program's returned value. Statements whose expressions contain a call to a tool with an effectful execution policy (anything other than `Pure`) are *implicit roots*: when their enclosing block runs, they evaluate in statement order before the block result, whether or not the result references them. This keeps `return waits only for values it references` precise for reads and transforms while guaranteeing that a fire-and-forget write the author bound is never silently dropped.
 
-At initial planning, the runtime creates nodes and edges for all statically discoverable expressions. It then performs reachability from the root return node. Dynamic branch/loop expansion can add reachable nodes later. Since version 1 has no detach primitive or expression statements, a standalone call is diagnosed during parser recovery:
+At initial planning, the runtime creates nodes and edges for all statically discoverable expressions. It then performs reachability from the root return node plus every effect-rooted statement of the executed block. Dynamic branch/loop expansion adds reachable nodes later; an effect binding inside a loop body roots once per iteration, and a postfix conditional around an effectful call still selects which branch dispatches. A failing effect root fails its block exactly like a referenced call, so `boundary` owns it.
 
-```text
-RL1204: result of `audit.log(...)` is not reachable from the program return and will not run
-  --> main.run:8:3
-help: include its result in the returned value, or pass it to a later call
-```
-
-This rule favors safe agent behavior. A future `emit` statement could represent durable ordered side effects, but it is outside version 1.
-
-After reachability analysis, an unused binding whose expression contains a tool call receives the same fatal `RL1204`, with fixes to flow the result into the block return or remove the binding. An unused binding containing only literals or deterministic local compute is pruned and receives warning `RL1205 UNUSED_BINDING`. Thus `x = tool()` never silently dispatches and never silently disappears from diagnostics.
+After reachability analysis, an unused binding whose expression contains an effectful call receives no diagnostic — it runs. An unused binding containing only pure calls, literals, or deterministic local compute is pruned and receives warning `RL1205 UNUSED_BINDING`. Thus a pure `x = tool()` never silently dispatches, an effectful one never silently disappears, and both outcomes are visible: the first in diagnostics, the second in the execution graph. (Fatal `RL1204 UNREACHABLE_EFFECT` from earlier drafts is retired; the code is reserved.)
 
 ### 2.6 Conditional expressions
 
-Runlet uses Python's conditional-expression shape and has no statement-form `if` in version 1:
+Runlet's primary conditional uses Python's conditional-expression shape:
 
 ```runlet
 label = "large" if order.total >= 1000 else "standard"
 ```
 
+The `else` arm is optional and defaults to `null`: `x if cond` is `x if cond else null`. Combined with null-omission for optional object properties (section 3.3) and implicit effect roots (section 2.5), this makes conditional writes and conditional properties first-class: `result = crm.update({ id: c.id }) if needs_fix` dispatches only when the condition holds and needs no explicit null arm.
+
+For branches too large for a postfix conditional, `if` is also a block-bodied expression — the branching counterpart, not an alias: a postfix conditional cannot hold multi-statement branches at all. Each branch is a full block ending in `return`, `else if` chains compose, a missing `else` yields `null`, and only the selected branch evaluates — its implicit effect roots included, so writes inside a branch dispatch exactly when the branch is selected:
+
+```runlet
+grade = if score >= 90 {
+    badge = badges.award({ user, kind: "gold" })
+    return "gold"
+} else if score >= 60 {
+    return "silver"
+} else {
+    return "bronze"
+}
+```
+
+There is still no statement-form `if`: the construct is an expression and its value is bound or returned (`RL1014` guides the rewrite, consuming the whole construct so one mistake yields one diagnostic).
+
 If a condition is resolved while planning, only the selected expression is planned. If it is an output, the runtime creates a `Branch` node depending on that condition. Neither result expression's effectful nodes are scheduled until selection. When the condition resolves, only the selected expression is expanded. The untaken expression is visible in source metadata but has no runtime call nodes; the graph UI shows it as `not_materialized`, not `skipped`.
 
-A condition must be Boolean. Runlet has no general truthiness conversion: empty strings, zero, empty lists, and null are not Booleans. If its inferred schema is `Any`, the analyzer inserts a runtime Boolean check; failure is a `RL5202 EXPECTED_BOOLEAN` compute error owned and catchable according to the expression's enclosing boundary. This removes a common class of generated-code mistakes without making `Any` unusable.
+A condition must be Boolean. Runlet has no general truthiness conversion: empty strings, zero, empty lists, and null are not Booleans. If its inferred schema is `Any`, the analyzer inserts a runtime Boolean check; failure is a `RL5202` compute error naming the actual value kind and the no-truthiness rule, stamped with the condition's source span, owned and catchable according to the expression's enclosing boundary. This removes a common class of generated-code mistakes without making `Any` unusable.
 
 Only the selected result is evaluated when its condition is unresolved. Conditional expressions and `boundary` expressions are the two version 1 mechanisms that merge alternative values into later dataflow. Nested right-associative conditional expressions express `else if` behavior.
 
@@ -229,6 +249,68 @@ Result order matches input order, independent of completion order. A failed iter
 
 Loop expansion is incremental: after the collection resolves, the runtime materializes at most `limit + prefetch` iteration scopes (recommended prefetch: `limit`) and adds more as permits become available. Thus a million-element input does not create a million live subgraphs. Graph event consumers still receive stable virtual iteration identities.
 
+### 2.7.1 `skip`
+
+`skip [if condition]` is the one statement that is not a binding. It is valid
+only directly inside a `for` or `fold` body — never at program level, and
+never inside a `boundary` block (a skip abandoning retry accounting mid-attempt
+would be incoherent; the parser rejects it with `RL1018`). A taken skip ends
+the current iteration: in `for`, the element is dropped from the loop result
+(filtering); in `fold`, the accumulator passes through unchanged. Skip
+conditions follow the same no-truthiness rule as all conditions and always
+evaluate, in statement order interleaved with implicit effect roots, before
+the block result. Making skips explicit (rather than treating a block that
+falls off the end as "yields nothing") preserves totality checking: a body
+path that neither returns nor skips is still a compile error, so a forgotten
+`return` cannot silently shorten a result list.
+
+### 2.7.2 `fold`
+
+`fold` is the sequential counterpart to `for` and the single way to reduce:
+
+```runlet
+total = fold acc = 0 for order in orders {
+    skip if order.status != "completed"
+    return acc + order.amount
+}
+```
+
+Each iteration binds a fresh accumulator (immutability is preserved — this is
+rebinding, not mutation) and the body's return becomes the next accumulator.
+An empty collection yields the initial value. There is no `limit`: iterations
+are sequential by definition, which is the point — `fold` is the construct
+that pins order-dependence, exactly as `for` pins bounded concurrency and
+`boundary` pins retry. Ordered effect chains and cursor pagination are
+expressible only here.
+
+The accumulator keeps one schema: the body result must convert back to the
+initial value's schema (`RL2313`) — strict one-pass unification rather than
+fixpoint widening, so errors stay legible. One widening is allowed: when the
+initial value converts *structurally* (never by formatting) into the body's
+schema, the accumulator adopts the body's schema. This covers the
+keyed-accumulation idiom — an `{}` seed merging computed-key entries
+(`acc + { [key]: value }`) widens to the map — and the find-first idiom — a
+`null` seed with `return item if match else acc` widens to `Item | Null`.
+Both would otherwise always trip `RL2313`. The analyzer warns (`RL1206`) when
+an effectful statement in a fold body never references the accumulator: the
+fold serializes work that a `for` loop would run concurrently.
+
+Named aggregate helpers (`list.sum` and friends) are deliberately absent:
+one way to express a reduction. See STDLIB.md.
+
+### 2.7.3 `fail`
+
+`fail(code, message[, details])` raises a catchable error, exactly like a
+failing tool call: same `ToolError`, same boundary ownership, span stamped
+from the expression. Errors raised by `fail` are never retryable — a
+model-detected logic condition does not get better on the next attempt; if
+retry semantics are wanted, let the underlying tool fail instead. The
+optional `details` object merges into the `err` value a `catch` block
+receives. `fail` is an expression of type `Never`, which unifies with
+everything, so both positions work: a guard statement
+(`g = fail("EMPTY", "no matches") if xs == []`) and an exhaustive alternative
+(`first = xs[0] if xs != [] else fail("EMPTY", "expected matches")`).
+
 ### 2.8 Error boundaries
 
 An error boundary is structured error handling for the reachable subgraph produced inside its body:
@@ -248,6 +330,8 @@ report = boundary retry 2 {
 `retry 2` means at most two retries after the initial attempt: three total attempts. Retry applies to retryable failures from reachable nodes created within the boundary, including descendant loop/branch nodes. Dependencies created outside the boundary are not retried. A durably successful call inside a failed attempt is reused only when its complete `operation_id` from section 4.2 is identical: workflow, logical call site, dynamic key, tool schema version, canonical resolved inputs, and operation generation must all match. Reusing a recorded result cannot repeat an effect and is valid for every execution class. A failed or uncertain call is eligible for automatic retry only according to the execution-class table in section 5.4. Distinct duplicate-input loop iterations therefore never reuse one another's result.
 
 Before retry, the runtime cancels unfinished work in the failed attempt and waits for cancellation acknowledgement or a configured cancellation grace timeout. It then applies the host retry policy. The count in source is a cap; the embedder supplies exponential backoff, jitter, maximum duration, and retryable error classification. Source cannot override those safety policies.
+
+The in-process executor implements the backoff part of that policy today: `RuntimeBuilder::retry_backoff(base, factor, cap)` delays re-attempt *k* by `min(cap, base × factorᵏ⁻¹)`, and a retryable `ToolError` carrying `retry_after` (e.g. from an HTTP `Retry-After` header) replaces the computed delay for that attempt, capped by `cap` when backoff is configured. The default is no delay. Backoff is purely a scheduling concern: delays never enter operation identity, canonical values, or the execution graph.
 
 The catch body runs once after attempts are exhausted or immediately for a non-retryable failure. It receives a structured error value:
 
@@ -352,8 +436,11 @@ The default conversion matrix is:
 | String | Integer/Number/Boolean/time | Not implicit by default; enable per parameter or use a parsing intrinsic |
 | Number | Integer | Not implicit; may truncate or overflow |
 | Any value | optional/union containing its type | Allowed |
+| Null | optional non-nullable object property | Allowed; the key is omitted from the converted object |
 | Object | Object | Allowed when every required target property is present and each property converts |
 | List | List | Element-wise when each element converts |
+
+The Null row exists because object literals have a fixed shape: `key: value if condition else null` is the only way to express a conditional property. Converting that null into an optional property that does not itself accept null drops the key, matching how JSON APIs treat null-as-absent. A required property, or an optional property whose schema is nullable, keeps the null and converts (or fails) normally.
 
 Non-finite floats are not valid portable values and cannot be produced by canonical numeric operations. `-0.0` formats as `0`; object keys must be strings. These rules make object-to-string conversion stable across replay and platforms.
 
@@ -698,15 +785,15 @@ The runtime validates fully resolved input immediately before dispatch and valid
 
 Language operators cover arithmetic, comparison, Boolean logic, member/index access, and list/object construction. Everything else is an intrinsic or tool and can be omitted/replaced by the host.
 
-The recommended deterministic intrinsic namespaces are:
-
-- `text`: length, join, split, replace, case conversion, formatting;
-- `list`: length, flatten, unique, sort, slice;
-- `object`: keys, values, entries, merge, get;
-- `json`: encode and decode with a supplied/expected schema;
-- `number`: round, floor, ceil, min, max, clamp;
-- `time`: parse, format, add, difference; and
-- `hash`: stable non-secret digests.
+The recommended deterministic intrinsic namespaces are `text`, `regex`,
+`list`, `json`, `number`, and `time` (`hash` is reserved for stable non-secret
+digests). There is deliberately no `object` namespace: computed keys, the `+`
+merge operator, membership tests, and `for`/`fold` iteration cover its whole
+territory in the grammar. Aggregation is not an intrinsic concern: `fold` is the single way to reduce and `skip` the single
+way to filter, so the stdlib carries no `sum`/`count`/`filter` helpers. The
+complete surface, its inclusion criteria, the no-lambda design, operator
+overloading decisions, and the regex dialect choice are specified in
+[`STDLIB.md`](STDLIB.md).
 
 `now()` and randomness are nondeterministic intrinsics whose first results are journaled. They are optional. The current time is not an implicit global.
 
@@ -979,8 +1066,9 @@ Exit: security review, fault-injection soak tests, documented SLOs, and versione
 
 Decided for version 1:
 
-- Tool effects are lazy and root-reachable; there is no fire-and-forget.
-- Loop bodies explicitly `return`; the concurrency limit bounds whole iterations.
+- Pure work is lazy and root-reachable; statements containing effectful calls are implicit roots, so bound fire-and-forget writes always run.
+- Loop bodies explicitly `return` or `skip`; the concurrency limit bounds whole iterations.
+- `for` pins bounded concurrency, `fold` pins sequential reduction, `boundary` pins retry: lambdas exist only at these controlled application sites and are never values.
 - `retry N` means N retries after the first attempt.
 - Conditions have no truthiness.
 - Safe object/list-to-string uses canonical JSON and propagates sensitivity.

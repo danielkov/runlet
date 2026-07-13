@@ -16,6 +16,9 @@
   "catch"
   "if"
   "else"
+  "fold"
+  "skip"
+  "fail"
 ] @keyword
 
 ["and" "or" "not"] @operator
@@ -23,6 +26,8 @@
 
 (binding_statement name: (identifier) @variable)
 (for_expression binding: (identifier) @variable)
+(fold_expression accumulator: (identifier) @variable)
+(fold_expression binding: (identifier) @variable)
 (boundary_expression error: (identifier) @variable)
 (object_item key: (field_name (identifier) @property))
 (member_expression property: (field_name) @property)

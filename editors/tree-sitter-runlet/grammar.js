@@ -27,7 +27,16 @@ module.exports = grammar({
 
     return_statement: ($) => seq("return", $._expression, optional(";")),
 
-    block: ($) => seq("{", repeat($.binding_statement), $.return_statement, "}"),
+    block: ($) =>
+      seq(
+        "{",
+        repeat(choice($.binding_statement, $.skip_statement)),
+        $.return_statement,
+        "}",
+      ),
+
+    skip_statement: ($) =>
+      seq("skip", optional(seq("if", field("condition", $._expression))), optional(";")),
 
     _expression: ($) =>
       choice(
@@ -37,9 +46,22 @@ module.exports = grammar({
         $.member_expression,
         $.index_expression,
         $.call_expression,
+        $.if_expression,
         $.for_expression,
+        $.fold_expression,
+        $.fail_expression,
         $.boundary_expression,
         $._primary_expression,
+      ),
+
+    if_expression: ($) =>
+      prec.right(
+        seq(
+          "if",
+          field("condition", $._expression),
+          field("consequence", $.block),
+          optional(seq("else", field("alternative", choice($.if_expression, $.block)))),
+        ),
       ),
 
     conditional_expression: ($) =>
@@ -49,8 +71,7 @@ module.exports = grammar({
           field("consequence", $._expression),
           "if",
           field("condition", $._expression),
-          "else",
-          field("alternative", $._expression),
+          optional(seq("else", field("alternative", $._expression))),
         ),
       ),
 
@@ -114,6 +135,27 @@ module.exports = grammar({
         field("body", $.block),
       ),
 
+    fold_expression: ($) =>
+      seq(
+        "fold",
+        field("accumulator", $.identifier),
+        "=",
+        field("initial", $._expression),
+        "for",
+        field("binding", $.identifier),
+        "in",
+        field("collection", $._expression),
+        field("body", $.block),
+      ),
+
+    fail_expression: ($) =>
+      seq(
+        "fail",
+        "(",
+        optional(seq($._expression, repeat(seq(",", $._expression)), optional(","))),
+        ")",
+      ),
+
     boundary_expression: ($) =>
       seq(
         "boundary",
@@ -156,14 +198,17 @@ module.exports = grammar({
     object_item: ($) =>
       choice(
         seq(field("key", choice($.field_name, $.string)), ":", field("value", $._expression)),
+        seq(field("computed_key", $.computed_key), ":", field("value", $._expression)),
         field("shorthand", $.identifier),
       ),
+
+    computed_key: ($) => seq("[", $._expression, "]"),
 
     field_name: ($) =>
       choice(
         $.identifier,
         "return", "for", "in", "limit", "boundary", "retry", "catch", "if", "else",
-        "and", "or", "not", "null", "true", "false",
+        "fold", "skip", "fail", "and", "or", "not", "null", "true", "false",
       ),
     identifier: (_) => /[_\p{L}][_\p{L}\p{M}\p{N}]*/,
     null: (_) => "null",

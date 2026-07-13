@@ -74,7 +74,7 @@ inspectable execution graph built into the language.
 | Make correct concurrency the default | Tool outputs behave like ordinary values; references create graph edges and independent nodes can run together. |
 | Keep programs easy for models to produce | The language has bindings, expressions, objects, lists, `for`, conditionals, boundaries, and `return`—but no imports, classes, functions, threads, or visible type syntax. |
 | Catch mistakes before tools run | The host registers every tool with input and output schemas. The analyzer checks names, calls, projections, operators, branches, and returned values. |
-| Avoid accidental effects | Execution is lazy and root-reachable. An unused tool call is rejected rather than silently dispatched. |
+| Avoid accidental effects, keep intended ones | Pure work is lazy and root-reachable: an unused pure computation is pruned with a warning, never dispatched. Statements containing effectful calls are implicit roots — a fire-and-forget write always runs when its block runs. |
 | Bound dynamic work | `for ... limit N` caps active iterations while preserving result order. |
 | Make failure handling explicit | `boundary retry N { ... } catch err { ... }` owns a subgraph, retries retryable failures, and produces a normal fallback value. |
 | Let hosts retain control | The embedder supplies the complete tool registry, implementations, schemas, execution policies, and external inputs. |
@@ -116,12 +116,22 @@ The main rules are deliberately compact:
 
 - Assignments create immutable bindings.
 - A program and every block end with `return`.
-- Objects and lists are ordinary structured values.
-- `value if condition else alternative` evaluates only the selected branch.
-- `for item in items limit N { ... }` returns an ordered list.
+- Objects and lists are ordinary structured values; `{ [expr]: value }`
+  computes a property key, and `left + right` merges two objects shallowly
+  (the right side wins).
+- `value if condition else alternative` evaluates only the selected branch;
+  `else` is optional and defaults to `null`. For larger branches,
+  `if cond { ... } else { ... }` is the block-bodied expression form — each
+  branch ends with `return`.
+- `for item in items limit N { ... }` returns an ordered list; `skip if
+  condition` drops an element.
+- `fold acc = init for item in items { ... }` reduces sequentially; the
+  body's `return` becomes the next accumulator.
 - `boundary retry N { ... } catch err { ... }` turns a failed subgraph into a
-  fallback value.
+  fallback value; `fail(code, message)` raises one.
 - Tool namespaces such as `crm.get_customer` come entirely from the host.
+- A small pure intrinsic library (`text.*`, `regex.*`, `list.*`, `json.*`,
+  `number.*`, `time.*`) covers data shaping; see [`STDLIB.md`](STDLIB.md).
 
 See [`examples/`](examples/) for executable programs and
 [`DESIGN.md`](DESIGN.md) for the complete language and runtime semantics.
@@ -174,7 +184,10 @@ fn main() {
 
 Tool handlers also receive stable operation, dispatch, schema-version, and
 attempt context. `run_observed` exposes the live graph event stream for logs,
-traces, dashboards, or an agent UI.
+traces, dashboards, or an agent UI. `.with_prelude()` installs the
+deterministic intrinsics from [`STDLIB.md`](STDLIB.md) (host registrations of
+the same names win), and `.retry_backoff(base, factor, cap)` configures
+exponential backoff between boundary retry attempts.
 
 ## Enriching an AgentKit runtime
 
