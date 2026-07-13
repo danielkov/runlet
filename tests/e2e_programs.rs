@@ -22,8 +22,8 @@ use runlet::{
     ToolRegistry,
 };
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn json_to_value(v: serde_json::Value) -> CanonicalValue {
     match v {
@@ -271,10 +271,16 @@ fn block_constructs_parse_inside_every_grouping_context() {
     let contexts = [
         ("binding", "value = {B}\nreturn value"),
         ("parenthesized", "value = ({B})\nreturn value"),
-        ("conditional else", "value = 0 if false else ({B})\nreturn value"),
+        (
+            "conditional else",
+            "value = 0 if false else ({B})\nreturn value",
+        ),
         ("list element", "value = [{B}]\nreturn value[0]"),
         ("object value", "value = { key: {B} }\nreturn value.key"),
-        ("computed key value", "value = { [\"k\"]: {B} }\nreturn value[\"k\"]"),
+        (
+            "computed key value",
+            "value = { [\"k\"]: {B} }\nreturn value[\"k\"]",
+        ),
         (
             "call argument",
             "value = text.join([\"a\"], \"\" + list.length([{B}]))\nreturn value",

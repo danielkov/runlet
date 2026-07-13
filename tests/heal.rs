@@ -1,7 +1,7 @@
 //! The auto-healing pre-pass: models' most common invalid-but-unambiguous
 //! programs repair mechanically, run, and report what was fixed.
 
-use runlet::{heal, CanonicalValue, Runtime};
+use runlet::{CanonicalValue, Runtime, heal};
 
 #[test]
 fn statement_form_if_with_returnless_branches_heals_and_runs() {

@@ -4,41 +4,70 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Runtime value schema used to validate inputs and analyze programs.
 pub enum Schema {
+    /// The `null` value.
     Null,
+    /// A Boolean value.
     Boolean,
+    /// A signed 64-bit integer with optional inclusive bounds.
     Integer {
+        /// Inclusive lower bound.
         min: Option<i64>,
+        /// Inclusive upper bound.
         max: Option<i64>,
     },
+    /// A finite binary64 number with optional inclusive bounds.
     Number {
+        /// Inclusive lower bound.
         min: Option<f64>,
+        /// Inclusive upper bound.
         max: Option<f64>,
     },
+    /// A Unicode string with optional semantic and size constraints.
     String {
+        /// Host-defined semantic format name.
         format: Option<String>,
+        /// Allowed values; empty means unrestricted.
         enumeration: Vec<String>,
+        /// Minimum number of Unicode scalar values.
         min_len: Option<usize>,
+        /// Maximum number of Unicode scalar values.
         max_len: Option<usize>,
     },
+    /// An opaque byte sequence.
     Bytes,
+    /// A homogeneous ordered list.
     List {
+        /// Schema shared by every element.
         items: Box<Schema>,
+        /// Minimum element count.
         min_len: Option<usize>,
+        /// Maximum element count.
         max_len: Option<usize>,
     },
+    /// An object with named properties.
     Object {
+        /// Known property definitions.
         properties: BTreeMap<String, Property>,
+        /// Properties that must be present.
         required: BTreeSet<String>,
+        /// Whether properties absent from `properties` are accepted.
         additional: bool,
     },
+    /// An object whose arbitrary keys share one value schema.
     Map {
+        /// Schema accepted by every map value.
         values: Box<Schema>,
     },
+    /// A value accepted by any of several schemas.
     Union {
+        /// Alternative accepted schemas.
         variants: Vec<Schema>,
+        /// Optional object property used to distinguish variants.
         discriminator: Option<String>,
     },
+    /// Any canonical Runlet value.
     Any,
     /// The type of expressions that never produce a value (`fail(...)`).
     /// Never unifies with anything: a branch that fails contributes nothing
@@ -47,19 +76,26 @@ pub enum Schema {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Schema and host metadata for an object property.
 pub struct Property {
+    /// Value schema for the property.
     pub schema: Schema,
     #[serde(default)]
+    /// Human-readable guidance for tool callers.
     pub documentation: String,
     #[serde(default)]
+    /// Whether observability systems should treat the value as sensitive.
     pub sensitive: bool,
     #[serde(default)]
+    /// Whether the value is a secret that must not be exposed.
     pub secret: bool,
     #[serde(default)]
+    /// Alternative names accepted by a host adapter.
     pub aliases: Vec<String>,
 }
 
 impl Property {
+    /// Creates a property with no metadata flags or aliases.
     pub fn new(schema: Schema) -> Self {
         Self {
             schema,
@@ -72,7 +108,9 @@ impl Property {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Ordered parameter schema for a tool call.
 pub struct CallSchema {
+    /// Schemas for positional parameters in call order.
     pub parameters: Vec<Schema>,
     /// How many leading parameters a call must provide; the rest are
     /// optional trailing parameters. `None` means every parameter is
@@ -81,12 +119,14 @@ pub struct CallSchema {
     pub required: Option<usize>,
 }
 impl CallSchema {
+    /// Creates a call schema in which every parameter is required.
     pub fn positional(parameters: Vec<Schema>) -> Self {
         Self {
             parameters,
             required: None,
         }
     }
+    /// Creates a required single-parameter call schema.
     pub fn one(schema: Schema) -> Self {
         Self::positional(vec![schema])
     }
@@ -106,33 +146,49 @@ impl CallSchema {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// Effect and retry semantics declared by a host tool.
 pub enum ExecutionPolicy {
+    /// No external effects; unused calls may be pruned and results reused.
     Pure,
+    /// Repeating the operation is safe and produces the same external effect.
     Idempotent,
+    /// The host can recover or reconcile an interrupted operation.
     Recoverable,
+    /// The operation must not be dispatched more than once.
     AtMostOnce,
+    /// The operation has effects without stronger retry guarantees.
     Unsafe,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Host-facing declaration of a callable tool.
 pub struct ToolDescriptor {
+    /// Fully qualified source name, such as `profile.lookup`.
     pub name: String,
+    /// Concise description for callers and generated tool catalogs.
     pub summary: String,
+    /// Positional input schema.
     pub input: CallSchema,
+    /// Successful output schema.
     pub output: Schema,
+    /// Effect and retry policy.
     pub execution: ExecutionPolicy,
+    /// Host-controlled version included in operation identity.
     pub schema_version: String,
 }
 
 #[derive(Debug, Clone, Default)]
+/// Deterministically ordered collection of tool descriptors.
 pub struct ToolRegistry {
     tools: BTreeMap<String, ToolDescriptor>,
 }
 
 impl ToolRegistry {
+    /// Creates an empty registry.
     pub fn new() -> Self {
         Self::default()
     }
+    /// Registers a descriptor, rejecting malformed or duplicate names.
     pub fn register(&mut self, descriptor: ToolDescriptor) -> Result<(), String> {
         if descriptor.name.split('.').any(|x| x.is_empty()) {
             return Err("tool names must contain non-empty path segments".into());
@@ -143,18 +199,22 @@ impl ToolRegistry {
         self.tools.insert(descriptor.name.clone(), descriptor);
         Ok(())
     }
+    /// Looks up a descriptor by its fully qualified name.
     pub fn get(&self, name: &str) -> Option<&ToolDescriptor> {
         self.tools.get(name)
     }
+    /// Iterates over fully qualified tool names in lexical order.
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.tools.keys().map(String::as_str)
     }
+    /// Returns the top-level namespace segments used by registered tools.
     pub fn roots(&self) -> BTreeSet<&str> {
         self.tools
             .keys()
             .filter_map(|n| n.split('.').next())
             .collect()
     }
+    /// Returns a deterministic hex digest of all descriptors.
     pub fn digest(&self) -> String {
         let bytes = serde_json::to_vec(&self.tools).expect("serializable");
         hex::encode(Sha256::digest(bytes))
@@ -162,14 +222,17 @@ impl ToolRegistry {
 }
 
 impl Schema {
+    /// Unbounded signed 64-bit integer schema.
     pub const INTEGER: Self = Self::Integer {
         min: None,
         max: None,
     };
+    /// Unbounded finite binary64 number schema.
     pub const NUMBER: Self = Self::Number {
         min: None,
         max: None,
     };
+    /// Creates an unconstrained string schema.
     pub fn string() -> Self {
         Self::String {
             format: None,
@@ -178,6 +241,7 @@ impl Schema {
             max_len: None,
         }
     }
+    /// Creates an unconstrained list with the given element schema.
     pub fn list(items: Schema) -> Self {
         Self::List {
             items: Box::new(items),
@@ -203,6 +267,7 @@ impl Schema {
         }
     }
 
+    /// Returns whether a canonical value satisfies this schema.
     pub fn accepts(&self, v: &CanonicalValue) -> bool {
         match (self, v) {
             (Self::Never, _) => false,

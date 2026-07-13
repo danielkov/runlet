@@ -17,9 +17,10 @@
 //!   (`RL1014`); missing branch returns then heal on the next pass;
 //! - a missing statement separator — newline inserted (`RL1008`).
 
-use crate::parser::parse;
 use crate::Diagnostic;
+use crate::parser::parse;
 
+/// Source produced by a successful mechanical repair pass.
 pub struct Healed {
     /// The repaired source; parses cleanly (later phases may still reject it).
     pub source: String,

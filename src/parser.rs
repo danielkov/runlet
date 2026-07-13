@@ -1,7 +1,10 @@
 use crate::diagnostic::{Diagnostic, Phase, Span};
-use crate::lexer::{lex, Token, TokenKind as T};
+use crate::lexer::{Token, TokenKind as T, lex};
 use crate::syntax::*;
 
+/// Parses Runlet source into its syntax tree.
+///
+/// Returns structured diagnostics when the source is not valid Runlet.
 pub fn parse(source: &str) -> Result<Program, Vec<Diagnostic>> {
     let tokens = lex(source)?;
     let mut p = Parser {

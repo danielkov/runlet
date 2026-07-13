@@ -1,4 +1,4 @@
-use crate::analyzer::{compile, CompiledProgram, ExternalInput};
+use crate::analyzer::{CompiledProgram, ExternalInput, compile};
 use crate::{
     BinaryOp, Block, CanonicalValue as V, Diagnostic, Expr, ExprKind, Graph, GraphChange,
     GraphEvent, NodeKind, NodeState, Schema, Span, ToolRegistry, UnaryOp,
@@ -10,21 +10,33 @@ use std::sync::{Arc, Condvar, Mutex};
 use thiserror::Error;
 
 #[derive(Debug, Clone)]
+/// Metadata supplied to a host tool handler for one dispatch attempt.
 pub struct ToolContext {
+    /// Execution graph node associated with this dispatch.
     pub node_id: String,
+    /// Stable identity shared by retries of the same logical operation.
     pub operation_id: String,
+    /// Identity unique to this individual dispatch attempt.
     pub dispatch_id: String,
+    /// Zero-based retry attempt.
     pub attempt: u32,
+    /// Version declared by the tool descriptor.
     pub schema_version: String,
 }
 
 #[derive(Debug, Clone, Error)]
 #[error("{code}: {message}")]
+/// Structured failure returned by a tool handler or the runtime.
 pub struct ToolError {
+    /// Stable machine-readable error code.
     pub code: String,
+    /// Human-readable failure description.
     pub message: String,
+    /// Whether a boundary may retry the operation.
     pub retryable: bool,
+    /// Whether the host cannot determine if an effect occurred.
     pub uncertain: bool,
+    /// Additional structured error data exposed to a catch block.
     pub details: BTreeMap<String, V>,
     /// Byte span of the source expression whose evaluation failed, stamped by
     /// the innermost evaluator frame. `None` for errors raised outside
@@ -37,6 +49,7 @@ pub struct ToolError {
     pub retry_after: Option<std::time::Duration>,
 }
 impl ToolError {
+    /// Creates a non-retryable error with no details or source span.
     pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             code: code.into(),
@@ -48,10 +61,12 @@ impl ToolError {
             retry_after: None,
         }
     }
+    /// Sets whether the error may be retried by a boundary.
     pub fn retryable(mut self, yes: bool) -> Self {
         self.retryable = yes;
         self
     }
+    /// Attaches a host-suggested delay before retrying.
     pub fn with_retry_after(mut self, delay: std::time::Duration) -> Self {
         self.retry_after = Some(delay);
         self
@@ -61,6 +76,7 @@ impl ToolError {
 type Handler = Arc<dyn Fn(&[V], &ToolContext) -> Result<V, ToolError> + Send + Sync>;
 
 #[derive(Clone)]
+/// Immutable compiler and in-process executor configured by [`RuntimeBuilder`].
 pub struct Runtime {
     registry: ToolRegistry,
     handlers: BTreeMap<String, Handler>,
@@ -121,11 +137,13 @@ impl Drop for DispatchPermit<'_> {
         self.0.released.notify_one();
     }
 }
+/// Builder for a [`Runtime`] and its complete host capability surface.
 pub struct RuntimeBuilder {
     runtime: Runtime,
 }
 
 impl Runtime {
+    /// Starts building a runtime with conservative default resource limits.
     pub fn builder() -> RuntimeBuilder {
         RuntimeBuilder {
             runtime: Runtime {
@@ -142,6 +160,7 @@ impl Runtime {
             },
         }
     }
+    /// Parses and analyzes source against this runtime's tools and inputs.
     pub fn compile(&self, source: &str) -> Result<CompiledProgram, Vec<Diagnostic>> {
         let inputs = self
             .inputs
@@ -153,6 +172,9 @@ impl Runtime {
             .collect::<Vec<_>>();
         compile(source, &self.registry, &inputs)
     }
+    /// Executes a previously compiled program to completion.
+    ///
+    /// The program must have been compiled against an equivalent registry.
     pub fn run(&self, program: &CompiledProgram) -> Result<Execution, ToolError> {
         self.run_observed(program, |_| {})
     }
@@ -250,14 +272,17 @@ impl Runtime {
     }
 }
 impl RuntimeBuilder {
+    /// Replaces the registry describing tools visible to programs.
     pub fn registry(mut self, registry: ToolRegistry) -> Self {
         self.runtime.registry = registry;
         self
     }
+    /// Adds or replaces a named, schema-checked host input.
     pub fn input(mut self, name: impl Into<String>, schema: Schema, value: V) -> Self {
         self.runtime.inputs.insert(name.into(), (schema, value));
         self
     }
+    /// Adds or replaces the implementation for a registered tool name.
     pub fn tool<F>(mut self, name: impl Into<String>, handler: F) -> Self
     where
         F: Fn(&[V], &ToolContext) -> Result<V, ToolError> + Send + Sync + 'static,
@@ -265,6 +290,7 @@ impl RuntimeBuilder {
         self.runtime.handlers.insert(name.into(), Arc::new(handler));
         self
     }
+    /// Sets the implicit loop limit and the maximum explicit loop limit.
     pub fn loop_limits(mut self, default: u32, max: u32) -> Self {
         self.runtime.default_loop_limit = default;
         self.runtime.max_loop_limit = max;
@@ -343,6 +369,7 @@ impl RuntimeBuilder {
         }
         self
     }
+    /// Validates the registry, handlers, and inputs, then builds the runtime.
     pub fn build(self) -> Result<Runtime, String> {
         for n in self.runtime.registry.names() {
             if !self.runtime.handlers.contains_key(n) {
@@ -364,8 +391,11 @@ impl RuntimeBuilder {
 }
 
 #[derive(Debug, Clone)]
+/// Final value and execution graph from a successful run.
 pub struct Execution {
+    /// Value returned by the program.
     pub value: V,
+    /// Final snapshot of the execution graph.
     pub graph: Graph,
 }
 #[derive(Clone)]
@@ -731,7 +761,7 @@ impl Evaluator<'_> {
                             if i == 0 { "code" } else { "message" },
                             value_kind(&other)
                         ),
-                    ))
+                    ));
                 }
             }
         }
@@ -746,7 +776,7 @@ impl Evaluator<'_> {
                     return Err(lang(
                         "RL5201",
                         &format!("fail details must be an object, got {}", value_kind(&other)),
-                    ))
+                    ));
                 }
             }
         }
@@ -1156,13 +1186,15 @@ impl Evaluator<'_> {
                 let next = next.clone();
                 let results = results.clone();
                 let run_iteration = &run_iteration;
-                scope.spawn(move || loop {
-                    let i = next.fetch_add(1, Ordering::Relaxed);
-                    let Some(value) = values.get(i).cloned() else {
-                        break;
-                    };
-                    let result = run_iteration(template.clone_for_branch(), i, value);
-                    results.lock().unwrap()[i] = Some(result);
+                scope.spawn(move || {
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(value) = values.get(i).cloned() else {
+                            break;
+                        };
+                        let result = run_iteration(template.clone_for_branch(), i, value);
+                        results.lock().unwrap()[i] = Some(result);
+                    }
                 });
             }
             loop {
@@ -1536,7 +1568,7 @@ fn numeric_binary(op: BinaryOp, a: V, b: V) -> Result<V, ToolError> {
                 BinaryOp::Greater => a > b,
                 BinaryOp::GreaterEqual => a >= b,
                 _ => false,
-            }))
+            }));
         }
         _ => return Err(lang("RL5201", "INVALID_NUMERIC_OPERANDS")),
     };
@@ -1651,7 +1683,7 @@ fn convert_value(value: V, expected: &Schema) -> Result<V, ToolError> {
                         return Err(lang(
                             "RL5208",
                             &format!("unexpected object property `{key}`"),
-                        ))
+                        ));
                     }
                 }
             }

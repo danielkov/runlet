@@ -4,28 +4,42 @@ use std::collections::BTreeMap;
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Deterministic runtime value representation used throughout Runlet.
 pub enum CanonicalValue {
+    /// Absence of a value.
     Null,
+    /// Boolean value.
     Boolean(bool),
+    /// Signed 64-bit integer.
     Integer(i64),
+    /// Finite binary64 number.
     Number(f64),
+    /// Unicode string.
     String(String),
+    /// Opaque byte sequence.
     Bytes(Vec<u8>),
+    /// Ordered list of values.
     List(Vec<CanonicalValue>),
+    /// String-keyed object kept in lexical key order.
     Object(BTreeMap<String, CanonicalValue>),
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
+/// Failure while constructing or serializing a canonical value.
 pub enum ValueError {
+    /// A `NaN` or infinite number was supplied.
     #[error("RL5103 NON_FINITE_NUMBER: non-finite numbers are not portable")]
     NonFiniteNumber,
+    /// JSON output was requested for a value containing raw bytes.
     #[error("RL5207 NOT_JSON_REPRESENTABLE: bytes have no implicit JSON encoding")]
     NotJsonRepresentable,
+    /// Serialization exceeded the defensive nesting limit.
     #[error("canonical presentation exceeded the configured depth")]
     DepthLimit,
 }
 
 impl CanonicalValue {
+    /// Creates a finite number, normalizing negative zero.
     pub fn number(value: f64) -> Result<Self, ValueError> {
         if value.is_finite() {
             Ok(Self::Number(if value == 0.0 { 0.0 } else { value }))
@@ -41,15 +55,20 @@ impl CanonicalValue {
         Ok(out)
     }
 
+    /// Returns the SHA-256 digest of the version-1 canonical encoding.
     pub fn digest(&self) -> Result<[u8; 32], ValueError> {
         let bytes = self.rcve()?;
         Ok(Sha256::digest(bytes).into())
     }
 
+    /// Returns the canonical digest as lowercase hexadecimal.
     pub fn digest_hex(&self) -> Result<String, ValueError> {
         Ok(hex::encode(self.digest()?))
     }
 
+    /// Serializes the value as deterministic, compact presentation JSON.
+    ///
+    /// Raw byte values return [`ValueError::NotJsonRepresentable`].
     pub fn presentation_json(&self) -> Result<String, ValueError> {
         let mut out = String::new();
         self.json(&mut out, 0)?;

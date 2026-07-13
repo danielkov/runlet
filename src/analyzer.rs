@@ -1,25 +1,36 @@
 use crate::{
-    parse, BinaryOp, Diagnostic, Expr, ExprKind, Phase, Program, Schema, Severity, Span,
-    ToolRegistry, UnaryOp,
+    BinaryOp, Diagnostic, Expr, ExprKind, Phase, Program, Schema, Severity, Span, ToolRegistry,
+    UnaryOp, parse,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone)]
+/// A named value supplied by the host and available to a Runlet program.
 pub struct ExternalInput {
+    /// Name used to reference the input in source code.
     pub name: String,
+    /// Schema the supplied value must satisfy.
     pub schema: Schema,
 }
 
 #[derive(Debug, Clone)]
+/// A parsed and schema-checked program ready for execution.
 pub struct CompiledProgram {
     pub(crate) program: Program,
+    /// Original Runlet source.
     pub source: String,
+    /// Hex-encoded digest of [`Self::source`].
     pub source_digest: String,
+    /// Digest of the tool registry used during compilation.
     pub registry_digest: String,
+    /// Non-fatal diagnostics, such as warnings about pruned bindings.
     pub diagnostics: Vec<Diagnostic>,
 }
 
+/// Parses and analyzes source against a tool registry and host inputs.
+///
+/// Returns all fatal parse or analysis diagnostics when compilation fails.
 pub fn compile(
     source: &str,
     registry: &ToolRegistry,
@@ -378,14 +389,18 @@ impl Analyzer<'_> {
                 // Literal regex patterns compile at compile time, so an
                 // invalid pattern is a span-annotated diagnostic before
                 // anything runs. Dynamic patterns stay a runtime concern.
-                if name.starts_with("regex.") {
-                    if let Some(pattern) = arguments.get(1) {
-                        if let ExprKind::String(literal) = &pattern.kind {
-                            if let Err(error) = crate::prelude::validate_pattern(literal) {
-                                self.err("RL2316", pattern.span, &error.to_string());
-                            }
-                        }
-                    }
+                let invalid_pattern = name
+                    .starts_with("regex.")
+                    .then_some(arguments.get(1))
+                    .flatten()
+                    .and_then(|pattern| match &pattern.kind {
+                        ExprKind::String(literal) => crate::prelude::validate_pattern(literal)
+                            .err()
+                            .map(|error| (pattern, error)),
+                        _ => None,
+                    });
+                if let Some((pattern, error)) = invalid_pattern {
+                    self.err("RL2316", pattern.span, &error.to_string());
                 }
                 tool.output.clone()
             }
@@ -967,11 +982,7 @@ fn project_schema(s: &Schema, f: &str) -> Option<Schema> {
                 .iter()
                 .filter_map(|s| project_schema(s, f))
                 .collect();
-            if x.is_empty() {
-                None
-            } else {
-                Some(union(x))
-            }
+            if x.is_empty() { None } else { Some(union(x)) }
         }
         _ => None,
     }
@@ -1009,9 +1020,7 @@ fn stdlib_hint(name: &str) -> Option<&'static str> {
         | "list.reverse" | "list.compact" => {
             "reduce with a fold instead: `total = fold acc = 0 for x in xs { return acc + x }`"
         }
-        "list.filter" | "list.map" => {
-            "use a `for` loop; `skip if condition` filters elements"
-        }
+        "list.filter" | "list.map" => "use a `for` loop; `skip if condition` filters elements",
         "list.group_by" | "list.index_by" | "object.from_entries" => {
             "accumulate with computed keys: `fold acc = {} for x in xs { return acc + { [x.key]: x } }`"
         }

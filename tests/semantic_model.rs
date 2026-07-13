@@ -384,7 +384,7 @@ fn loops_are_ordered_and_boundaries_catch_failures() {
         })
         .build()
         .unwrap();
-    let source="result = boundary {\n values = for item in [1, 2, 3] limit 2 { return work(item) }\n return values\n} catch err { return [err.code] }\nreturn result";
+    let source = "result = boundary {\n values = for item in [1, 2, 3] limit 2 { return work(item) }\n return values\n} catch err { return [err.code] }\nreturn result";
     let execution = runtime.run(&runtime.compile(source).unwrap()).unwrap();
     assert_eq!(execution.value, CanonicalValue::List(vec!["BOOM".into()]));
 }
@@ -423,16 +423,18 @@ fn boundary_retry_reuses_successful_operations() {
         })
         .build()
         .unwrap();
-    let source="result = boundary retry 1 { a = stable()\n b = flaky()\n return a + b } catch err { return -1 }\nreturn result";
+    let source = "result = boundary retry 1 { a = stable()\n b = flaky()\n return a + b } catch err { return -1 }\nreturn result";
     let execution = runtime.run(&runtime.compile(source).unwrap()).unwrap();
     assert_eq!(execution.value, 3.into());
     assert_eq!(*stable_calls.lock().unwrap(), 1);
     assert_eq!(*flaky_calls.lock().unwrap(), 2);
-    assert!(execution
-        .graph
-        .edges
-        .iter()
-        .any(|edge| edge.kind == EdgeKind::RetryOf));
+    assert!(
+        execution
+            .graph
+            .edges
+            .iter()
+            .any(|edge| edge.kind == EdgeKind::RetryOf)
+    );
 }
 
 #[test]
@@ -456,11 +458,13 @@ fn conversions_and_short_circuiting_are_observable() {
     };
     assert_eq!(value["number"], CanonicalValue::Number(42.0));
     assert_eq!(value["label"], CanonicalValue::String("count: 3".into()));
-    assert!(execution
-        .graph
-        .nodes
-        .iter()
-        .any(|n| n.kind == NodeKind::Convert));
+    assert!(
+        execution
+            .graph
+            .nodes
+            .iter()
+            .any(|n| n.kind == NodeKind::Convert)
+    );
 }
 
 #[test]
@@ -503,9 +507,11 @@ fn loop_limits_bound_parallel_execution_and_stream_graph_events() {
     );
     assert_eq!(maximum.load(Ordering::SeqCst), 3);
     let events = events.lock().unwrap();
-    assert!(events
-        .windows(2)
-        .all(|pair| pair[0].sequence < pair[1].sequence));
+    assert!(
+        events
+            .windows(2)
+            .all(|pair| pair[0].sequence < pair[1].sequence)
+    );
     assert!(events.iter().any(|event| matches!(
         event.change,
         GraphChange::NodeUpdated(ref node) if node.state == NodeState::Running
