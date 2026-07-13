@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/runlet-logo.png" alt="Runlet logo" width="220">
+</p>
+
 # Runlet
 
 Runlet is a small orchestration language for LLM agents. It lets an agent
