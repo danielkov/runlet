@@ -3,7 +3,7 @@ use std::{fs, path::PathBuf};
 
 #[test]
 fn core_examples_compile_and_run_without_tools() {
-    let runtime = Runtime::builder().build().unwrap();
+    let runtime = Runtime::builder().with_prelude().build().unwrap();
     let examples = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples");
     let mut files = fs::read_dir(examples)
         .unwrap()

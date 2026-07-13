@@ -40,6 +40,10 @@ pub enum Schema {
         discriminator: Option<String>,
     },
     Any,
+    /// The type of expressions that never produce a value (`fail(...)`).
+    /// Never unifies with anything: a branch that fails contributes nothing
+    /// to the surrounding schema. No runtime value has this schema.
+    Never,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -70,15 +74,33 @@ impl Property {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CallSchema {
     pub parameters: Vec<Schema>,
+    /// How many leading parameters a call must provide; the rest are
+    /// optional trailing parameters. `None` means every parameter is
+    /// required.
+    #[serde(default)]
+    pub required: Option<usize>,
 }
 impl CallSchema {
     pub fn positional(parameters: Vec<Schema>) -> Self {
-        Self { parameters }
+        Self {
+            parameters,
+            required: None,
+        }
     }
     pub fn one(schema: Schema) -> Self {
+        Self::positional(vec![schema])
+    }
+    /// A schema whose trailing parameters past `required` may be omitted.
+    pub fn optional_trailing(parameters: Vec<Schema>, required: usize) -> Self {
+        debug_assert!(required <= parameters.len());
         Self {
-            parameters: vec![schema],
+            parameters,
+            required: Some(required),
         }
+    }
+    /// The minimum number of arguments a call must provide.
+    pub fn required_count(&self) -> usize {
+        self.required.unwrap_or(self.parameters.len())
     }
 }
 
@@ -163,8 +185,27 @@ impl Schema {
             max_len: None,
         }
     }
+    /// Short lowercase name of the schema's kind, for diagnostics.
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            Self::Any => "any",
+            Self::Null => "null",
+            Self::Boolean => "boolean",
+            Self::Integer { .. } => "integer",
+            Self::Number { .. } => "number",
+            Self::String { .. } => "string",
+            Self::Bytes => "bytes",
+            Self::List { .. } => "list",
+            Self::Map { .. } => "map",
+            Self::Object { .. } => "object",
+            Self::Union { .. } => "union",
+            Self::Never => "never",
+        }
+    }
+
     pub fn accepts(&self, v: &CanonicalValue) -> bool {
         match (self, v) {
+            (Self::Never, _) => false,
             (Self::Any, _) => true,
             (Self::Null, CanonicalValue::Null) => true,
             (Self::Boolean, CanonicalValue::Boolean(_)) => true,

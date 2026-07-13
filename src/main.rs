@@ -118,6 +118,7 @@ fn demo_runtime() -> Runtime {
         .unwrap();
     Runtime::builder()
         .registry(registry)
+        .with_prelude()
         .tool("demo.task", |args, _| {
             let CanonicalValue::String(label) = &args[0] else {
                 unreachable!()

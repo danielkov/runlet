@@ -17,6 +17,9 @@ pub(crate) enum TokenKind {
     In,
     Limit,
     Boundary,
+    Fold,
+    Skip,
+    Fail,
     Retry,
     Catch,
     If,
@@ -89,6 +92,7 @@ pub(crate) fn lex(source: &str) -> Result<Vec<Token>, Vec<Diagnostic>> {
         diagnostics: vec![],
         paren: 0,
         bracket: 0,
+        frames: Vec::new(),
     };
     while lx.pos < source.len() {
         lx.one();
@@ -111,6 +115,10 @@ struct Lexer<'a> {
     diagnostics: Vec<Diagnostic>,
     paren: usize,
     bracket: usize,
+    /// Grouping counts saved at each `{`: newlines are statement
+    /// terminators inside braces (blocks and object literals) even when the
+    /// brace group itself sits inside parentheses or brackets.
+    frames: Vec<(usize, usize)>,
 }
 
 impl Lexer<'_> {
@@ -152,8 +160,19 @@ impl Lexer<'_> {
                 self.bracket = self.bracket.saturating_sub(1);
                 self.push(TokenKind::RBracket, start);
             }
-            '{' => self.push(TokenKind::LBrace, start),
-            '}' => self.push(TokenKind::RBrace, start),
+            '{' => {
+                self.frames.push((self.paren, self.bracket));
+                self.paren = 0;
+                self.bracket = 0;
+                self.push(TokenKind::LBrace, start);
+            }
+            '}' => {
+                if let Some((paren, bracket)) = self.frames.pop() {
+                    self.paren = paren;
+                    self.bracket = bracket;
+                }
+                self.push(TokenKind::RBrace, start);
+            }
             '.' => self.push(TokenKind::Dot, start),
             ',' => self.push(TokenKind::Comma, start),
             ':' => self.push(TokenKind::Colon, start),
@@ -289,6 +308,9 @@ impl Lexer<'_> {
             "in" => TokenKind::In,
             "limit" => TokenKind::Limit,
             "boundary" => TokenKind::Boundary,
+            "fold" => TokenKind::Fold,
+            "skip" => TokenKind::Skip,
+            "fail" => TokenKind::Fail,
             "retry" => TokenKind::Retry,
             "catch" => TokenKind::Catch,
             "if" => TokenKind::If,
