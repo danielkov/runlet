@@ -12,20 +12,42 @@ return {profile, customer: customer.email}
   (binding_statement
     name: (identifier)
     value: (object
-      (object_item key: (field_name (identifier)) value: (string))
-      (object_item key: (field_name (identifier)) value: (boolean))
-      (object_item key: (field_name (identifier)) value: (list (integer) (integer)))))
+      (object_item
+        key: (field_name
+          (identifier))
+        value: (string))
+      (object_item
+        key: (field_name
+          (identifier))
+        value: (boolean))
+      (object_item
+        key: (field_name
+          (identifier))
+        value: (list
+          (integer)
+          (integer)))))
   (binding_statement
     name: (identifier)
     value: (call_expression
-      function: (member_expression object: (identifier) property: (field_name (identifier)))
-      (member_expression object: (identifier) property: (field_name (identifier)))))
+      function: (member_expression
+        object: (identifier)
+        property: (field_name
+          (identifier)))
+      (member_expression
+        object: (identifier)
+        property: (field_name
+          (identifier)))))
   (return_statement
     (object
-      (object_item shorthand: (identifier))
       (object_item
-        key: (field_name (identifier))
-        value: (member_expression object: (identifier) property: (field_name (identifier)))))))
+        shorthand: (identifier))
+      (object_item
+        key: (field_name
+          (identifier))
+        value: (member_expression
+          object: (identifier)
+          property: (field_name
+            (identifier)))))))
 
 ==================
 Control expressions
@@ -47,7 +69,10 @@ return safe if enabled and true else rows
       body: (block
         (return_statement
           (binary_expression
-            left: (member_expression object: (identifier) property: (field_name (identifier)))
+            left: (member_expression
+              object: (identifier)
+              property: (field_name
+                (identifier)))
             right: (integer))))))
   (binding_statement
     name: (identifier)
@@ -55,13 +80,109 @@ return safe if enabled and true else rows
       retries: (integer)
       body: (block
         (return_statement
-          (binary_expression left: (integer) right: (identifier))))
+          (binary_expression
+            left: (integer)
+            right: (identifier))))
       error: (identifier)
       handler: (block
         (return_statement
-          (member_expression object: (identifier) property: (field_name (identifier)))))))
+          (member_expression
+            object: (identifier)
+            property: (field_name
+              (identifier)))))))
   (return_statement
     (conditional_expression
       consequence: (identifier)
-      condition: (binary_expression left: (identifier) right: (boolean))
+      condition: (binary_expression
+        left: (identifier)
+        right: (boolean))
       alternative: (identifier))))
+
+==================
+Folds, skips, and computed keys
+==================
+
+grouped = fold acc = {} for order in orders {
+    skip if order.status != "completed"
+    return acc + { [order.region]: order.id }
+}
+return grouped
+
+---
+
+(source_file
+  (binding_statement
+    (identifier)
+    (fold_expression
+      (identifier)
+      (object)
+      (identifier)
+      (identifier)
+      (block
+        (skip_statement
+          (binary_expression
+            (member_expression
+              (identifier)
+              (field_name
+                (identifier)))
+            (string)))
+        (return_statement
+          (binary_expression
+            (identifier)
+            (object
+              (object_item
+                (computed_key
+                  (member_expression
+                    (identifier)
+                    (field_name
+                      (identifier))))
+                (member_expression
+                  (identifier)
+                  (field_name
+                    (identifier))))))))))
+  (return_statement
+    (identifier)))
+
+==================
+Block-bodied if and fail
+==================
+
+tier = if total >= 100 {
+    return "gold"
+} else if total >= 50 {
+    return "silver"
+} else {
+    return fail("EMPTY", "no data")
+}
+return tier if total > 0
+
+---
+
+(source_file
+  (binding_statement
+    (identifier)
+    (if_expression
+      (binary_expression
+        (identifier)
+        (integer))
+      (block
+        (return_statement
+          (string)))
+      (if_expression
+        (binary_expression
+          (identifier)
+          (integer))
+        (block
+          (return_statement
+            (string)))
+        (block
+          (return_statement
+            (fail_expression
+              (string)
+              (string)))))))
+  (return_statement
+    (conditional_expression
+      (identifier)
+      (binary_expression
+        (identifier)
+        (integer)))))
