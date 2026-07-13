@@ -1523,3 +1523,27 @@ fn runtime_errors_inside_loop_iterations_keep_their_spans() {
     let span = error.span.expect("loop-iteration errors carry spans");
     assert_eq!(&source[span.start..span.end], "x[0]");
 }
+
+#[test]
+fn fold_with_a_limit_gets_one_targeted_diagnostic() {
+    let runtime = Runtime::builder().build().unwrap();
+    let source = "
+xs = [1, 2, 3]
+total = fold acc = 0 for x in xs limit 8 {
+    return acc + x
+}
+return total
+";
+    let diagnostics = runtime
+        .compile(source)
+        .expect_err("fold has no limit clause");
+    let errors: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.severity == Severity::Error)
+        .collect();
+    assert_eq!(errors.len(), 1, "one construct-level error: {errors:#?}");
+    assert_eq!(errors[0].code, "RL1020");
+    let fix = errors[0].fixes.first().expect("has a removal fix");
+    assert_eq!(fix.replacement, "");
+    assert_eq!(&source[fix.span.start..fix.span.end], "limit 8");
+}

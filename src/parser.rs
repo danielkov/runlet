@@ -645,6 +645,26 @@ impl Parser {
         };
         self.expect_take(&T::In, "`in`")?;
         let collection = Box::new(self.expr(0)?);
+        if self.at(&T::Limit) {
+            let limit_start = self.current().span;
+            self.bump();
+            let mut limit_end = limit_start;
+            if matches!(self.current().kind, T::Integer(_)) {
+                limit_end = self.current().span;
+                self.bump();
+            }
+            let span = limit_start.join(limit_end);
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "RL1020",
+                    Phase::Parse,
+                    span,
+                    "fold has no `limit`",
+                    "fold iterations are sequential by definition; `limit N` bounds                      only the concurrent `for` loop",
+                )
+                .with_fix(span, "", "remove `limit N` from the fold"),
+            );
+        }
         let body = self.loop_body()?;
         Some(Expr {
             span: start.join(body.span),

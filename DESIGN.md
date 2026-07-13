@@ -278,7 +278,8 @@ total = fold acc = 0 for order in orders {
 Each iteration binds a fresh accumulator (immutability is preserved — this is
 rebinding, not mutation) and the body's return becomes the next accumulator.
 An empty collection yields the initial value. There is no `limit`: iterations
-are sequential by definition, which is the point — `fold` is the construct
+are sequential by definition (writing `limit N` on a fold is rejected with
+`RL1020` and a removal fix), which is the point — `fold` is the construct
 that pins order-dependence, exactly as `for` pins bounded concurrency and
 `boundary` pins retry. Ordered effect chains and cursor pagination are
 expressible only here.
