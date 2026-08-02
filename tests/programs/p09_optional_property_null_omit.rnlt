@@ -3,7 +3,7 @@
 # `key: value if cond` omits the key when the condition fails; the write
 # schema's optional properties accept the omission.
 contacts = data.contacts()
-flags = for c in contacts limit 4 {
+flags = for c in contacts {
     needs_fix = not regex.test(c.phone, "^\\+1[0-9]{10}$")
     r = write.update({
         id: c.id,

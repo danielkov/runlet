@@ -12,7 +12,7 @@ benchmark.
 ## 1. Principles
 
 The grammar stays closed. Bindings, expressions, objects (including computed
-keys), lists, `for`, `fold`, `skip`, `fail`, postfix conditionals,
+keys), lists, `for`, `fold`, `skip`, `assert`, `fail`, postfix conditionals,
 `boundary`, and `return` are the whole language; every capability below is an
 intrinsic that shares tool-call syntax, schema checking, and the execution
 graph. A model that has learned to call one tool has learned the entire
@@ -63,7 +63,7 @@ impossible. Three options were considered:
 | Blocks at controlled application sites + computed keys | **Adopted.** |
 
 Runlet's loops *are* lambdas — applied only at sites that pin execution
-semantics: `for` (bounded concurrency), `fold` (sequential reduction),
+semantics: `for` (host-bounded concurrency), `fold` (sequential reduction),
 `boundary` (retry). Four mechanisms close the gap without function values:
 
 **`skip` filters.** `skip if cond` inside a `for` body drops the element;
@@ -179,7 +179,7 @@ Everything a `fold` or a `for` body expresses clearly is deliberately absent
 | `list.sort(xs)` | Natural order for homogeneous scalars; mixed kinds fail catchably (matches no-truthiness strictness; Starlark's total order across kinds silently "works" on garbage). A fold could only express an insertion sort. |
 | `list.sort_by(xs, path)` | Dotted key path; optional `"desc"` third argument; `null` values sort last, stable. The `"desc"` string is the one stringly-typed flag in the library — every alternative (a `reverse` function, key negation) is worse. |
 | `list.slice(xs, start, end)` | Negative indices, clamped — same rules as indexing. |
-| `list.range(start, end)` | Inclusive-exclusive integer range; replaces literal `[1, 2, ..., 10]` pagination lists and gives `fold` an index sequence. Capped by the host node budget. |
+| `list.range(start, end[, step])` | Inclusive-exclusive integer range by an optional step (default 1; negative counts down); replaces literal `[1, 2, ..., 10]` pagination lists and gives `fold` an index sequence. Capped by the host node budget. |
 
 `list.group_by` and `list.index_by` from the first draft are cut: computed
 keys made them fold-expressible (section 2), and the same rule that removed

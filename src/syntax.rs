@@ -50,6 +50,13 @@ pub enum StmtKind {
         /// Optional condition; absent means always skip.
         condition: Option<Expr>,
     },
+    /// `assert(condition[, message])` — eagerly checks a runtime invariant.
+    Assert {
+        /// Boolean condition that must hold.
+        condition: Expr,
+        /// Optional failure message, evaluated only when the assertion fails.
+        message: Option<Expr>,
+    },
 }
 
 impl Stmt {
@@ -57,7 +64,7 @@ impl Stmt {
     pub fn binding(&self) -> Option<(&String, &Expr)> {
         match &self.kind {
             StmtKind::Binding { name, value } => Some((name, value)),
-            StmtKind::Skip { .. } => None,
+            StmtKind::Skip { .. } | StmtKind::Assert { .. } => None,
         }
     }
 }
@@ -172,14 +179,12 @@ pub enum ExprKind {
         /// Optional block evaluated when the condition is false.
         else_block: Option<Block>,
     },
-    /// Ordered, bounded concurrent map over a collection.
+    /// Ordered, host-bounded concurrent map over a collection.
     For {
         /// Per-iteration element binding.
         binding: String,
         /// Collection expression.
         collection: Box<Expr>,
-        /// Optional explicit concurrency limit.
-        limit: Option<u32>,
         /// Per-element body.
         body: Block,
     },

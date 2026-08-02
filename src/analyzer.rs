@@ -97,6 +97,19 @@ impl Analyzer<'_> {
                     }
                     continue;
                 }
+                crate::StmtKind::Assert { condition, message } => {
+                    let condition_type = self.expr(condition);
+                    if !boolean_context(&condition_type) {
+                        self.err("RL2305", condition.span, "assert condition must be Boolean");
+                    }
+                    if let Some(message) = message {
+                        let message_type = self.expr(message);
+                        if !string_context(&message_type) {
+                            self.err("RL2317", message.span, "assert message must be a string");
+                        }
+                    }
+                    continue;
+                }
             };
             if self.registry_roots.contains(name) {
                 self.diagnostics.push(
@@ -153,6 +166,12 @@ impl Analyzer<'_> {
                     condition: Some(condition),
                 } => collect_names(condition, &defs, &mut used),
                 crate::StmtKind::Skip { condition: None } => {}
+                crate::StmtKind::Assert { condition, message } => {
+                    collect_names(condition, &defs, &mut used);
+                    if let Some(message) = message {
+                        collect_names(message, &defs, &mut used);
+                    }
+                }
             }
         }
         for s in stmts {
@@ -284,15 +303,16 @@ impl Analyzer<'_> {
                 }
                 let t = self.expr(target);
                 project_schema(&t, field).unwrap_or_else(|| {
+                    let mut message = format!(
+                        "property `{field}` is not available on this value of type {}",
+                        t.type_notation()
+                    );
+                    if matches!(t, Schema::List { .. }) {
+                        message.push_str(" — iterate or index the list itself");
+                    }
                     self.diagnostics.push(
-                        Diagnostic::error(
-                            "RL2103",
-                            Phase::Analyze,
-                            e.span,
-                            "unknown property",
-                            format!("property `{field}` is not available on this value"),
-                        )
-                        .with_candidates(schema_fields(&t)),
+                        Diagnostic::error("RL2103", Phase::Analyze, e.span, "unknown property", message)
+                            .with_candidates(schema_fields(&t)),
                     );
                     Schema::Any
                 })
@@ -478,12 +498,8 @@ impl Analyzer<'_> {
             ExprKind::For {
                 binding,
                 collection,
-                limit,
                 body,
             } => {
-                if limit.is_some_and(|x| x == 0 || x > 1024) {
-                    self.err("RL4102", e.span, "loop limit must be between 1 and 1024")
-                }
                 let c = self.expr(collection);
                 let item = iterable_item_schema(&c).unwrap_or_else(|| {
                     self.err(
@@ -640,7 +656,7 @@ impl Analyzer<'_> {
                     format!(
                         "this tool call does not depend on `{accumulator}`; a `fold` runs \
                          iterations one after another — if each item is independent, use \
-                         `for ... limit N` to run them concurrently"
+                         `for ...` to run them concurrently"
                     ),
                 ));
             }
@@ -673,6 +689,17 @@ fn boolean_context(s: &Schema) -> bool {
         s,
         Schema::Boolean | Schema::Any | Schema::Union { .. } | Schema::Never
     )
+}
+
+/// Whether a schema could produce a string: unions qualify only when some
+/// variant does, so a statically string-free value is rejected at compile
+/// time and the runtime check remains a backstop for `Any` leaks.
+fn string_context(s: &Schema) -> bool {
+    match s {
+        Schema::String { .. } | Schema::Any | Schema::Never => true,
+        Schema::Union { variants, .. } => variants.iter().any(string_context),
+        _ => false,
+    }
 }
 
 fn path_of(e: &Expr) -> Option<String> {
@@ -761,16 +788,13 @@ pub(crate) fn contains_effectful_call(e: &Expr, registry: &ToolRegistry) -> bool
 /// Applies a predicate to every statement expression (binding values and
 /// skip conditions) and the result of a block.
 fn block_contains(b: &crate::Block, pred: impl Fn(&Expr) -> bool + Copy) -> bool {
-    b.statements.iter().filter_map(stmt_expr).any(pred) || pred(&b.result)
-}
-
-/// The expression a statement evaluates: a binding's value or a skip's
-/// condition.
-fn stmt_expr(s: &crate::Stmt) -> Option<&Expr> {
-    match &s.kind {
-        crate::StmtKind::Binding { value, .. } => Some(value),
-        crate::StmtKind::Skip { condition } => condition.as_ref(),
-    }
+    b.statements.iter().any(|statement| match &statement.kind {
+        crate::StmtKind::Binding { value, .. } => pred(value),
+        crate::StmtKind::Skip { condition } => condition.as_ref().is_some_and(pred),
+        crate::StmtKind::Assert { condition, message } => {
+            pred(condition) || message.as_ref().is_some_and(pred)
+        }
+    }) || pred(&b.result)
 }
 fn contains_call(e: &Expr) -> bool {
     match &e.kind {
@@ -908,14 +932,20 @@ fn collect_block_names(
         }
     }
     collect_names(&block.result, &extended, used);
-    // Skip guards always evaluate when the block runs; their conditions are
+    // Guards always evaluate when the block runs; their expressions are
     // reachable regardless of the block result.
     for stmt in &block.statements {
-        if let crate::StmtKind::Skip {
-            condition: Some(condition),
-        } = &stmt.kind
-        {
-            collect_names(condition, &extended, used);
+        match &stmt.kind {
+            crate::StmtKind::Skip {
+                condition: Some(condition),
+            } => collect_names(condition, &extended, used),
+            crate::StmtKind::Assert { condition, message } => {
+                collect_names(condition, &extended, used);
+                if let Some(message) = message {
+                    collect_names(message, &extended, used);
+                }
+            }
+            _ => {}
         }
     }
 }

@@ -20,7 +20,7 @@ The language has no imports, packages, user-defined classes, macros, threads, ex
 
 ### 1.1 The complete user mental model (under 100 model tokens in common tokenizers)
 
-> Tool calls return hidden future values. Calls run when inputs are ready; references create edges, so independent calls run in parallel. Only calls flowing into `return` run. `if` and `for` create dynamic graph nodes; `limit N` bounds concurrent iterations. `boundary { ... } catch err { ... }` handles subgraph failures. `return` waits only for referenced values. Types and safe conversions come from tool schemas and are never written. Errors point to a fix.
+> Tool calls return hidden future values. Calls run when inputs are ready; references create edges, so independent calls run in parallel. Only calls flowing into `return` run. `if` and `for` create dynamic graph nodes; the host bounds concurrent iterations. `assert` checks invariants without returning intermediate values. `boundary { ... } catch err { ... }` handles subgraph failures. `return` waits only for referenced values. Types and safe conversions come from tool schemas and are never written. Errors point to a fix.
 
 ### 1.2 Goals
 
@@ -45,7 +45,7 @@ The language has no imports, packages, user-defined classes, macros, threads, ex
 
 ### 2.1 Lexical rules
 
-Source is UTF-8. Identifiers use Unicode XID start/continue rules; tool authors SHOULD expose simple ASCII identifiers. The reserved words are `return`, `for`, `in`, `limit`, `boundary`, `retry`, `catch`, `if`, `else`, `and`, `or`, `not`, `null`, `true`, and `false`. They cannot be binding names or registry roots. A reserved word is permitted contextually as an object property name or after `.`, so `{ limit: 10 }` and `result.limit` remain natural; quoted/indexed spellings are also valid.
+Source is UTF-8. Identifiers use Unicode XID start/continue rules; tool authors SHOULD expose simple ASCII identifiers. The reserved words are `return`, `for`, `in`, `boundary`, `fold`, `skip`, `assert`, `fail`, `retry`, `catch`, `if`, `else`, `and`, `or`, `not`, `null`, `true`, and `false`. They cannot be binding names or registry roots. A reserved word is permitted contextually as an object property name or after `.`, so `{ assert: true }` and `result.assert` remain natural; quoted/indexed spellings are also valid.
 
 Indentation is not significant. A newline terminates a simple statement unless it occurs inside an open `()`, `[]`, or expression-object `{}`, or the preceding token is one of this exhaustive continuation set: `=`, `,`, `:`, `+`, `-`, `*`, `/`, `%`, `==`, `!=`, `<`, `<=`, `>`, `>=`, `and`, `or`, `not`, `in`, `if`, or `else`. Compound `for`, `boundary`, and `catch` headers must place their opening `{` on the header line; a boundary body's closing `}` and its `catch` must likewise be on one line as `} catch err {`. A newline immediately followed by `(` or `[` never continues the preceding expression; a call/index continuation must remain on the same line or wrap the whole expression in open parentheses. Semicolons may terminate simple statements and are optional immediately before `}`. Comments start with `#` or `//` and continue to end of line. Block comments are deliberately omitted.
 
@@ -64,16 +64,16 @@ Numbers do not silently lose precision. Integer literals are arbitrary precision
 The following EBNF is normative for the version 1 surface grammar. Whitespace, comments, and statement terminators are elided. There are deliberately no effectful expression statements, statement-form control structures, or early returns. `skip` is the one non-binding statement: it is loop-body control (section 2.7.1), not an expression.
 
 ```ebnf
-program       = let_stmt* , return_stmt ;
+program       = ( let_stmt | assert_stmt )* , return_stmt ;
 
 let_stmt      = IDENT , "=" , expression ;
 skip_stmt     = "skip" , ( "if" , conditional_or )? ;   (* for/fold bodies only *)
+assert_stmt   = "assert" , "(" , expression , ( "," , expression )? , ")" ;
 return_stmt   = "return" , expression ;
 
 if_expr       = "if" , expression , block_return ,
                 ( "else" , ( if_expr | block_return ) )? ;
-for_expr      = "for" , IDENT , "in" , expression ,
-                ( "limit" , INTEGER )? , block_return ;
+for_expr      = "for" , IDENT , "in" , expression , block_return ;
 fold_expr     = "fold" , IDENT , "=" , expression ,
                 "for" , IDENT , "in" , expression , block_return ;
 fail_expr     = "fail" , "(" , arguments , ")" ;
@@ -81,7 +81,7 @@ fail_expr     = "fail" , "(" , arguments , ")" ;
 boundary_expr = "boundary" , retry_clause? , block_return , catch_clause_return ;
 retry_clause  = "retry" , INTEGER ;
 catch_clause_return = "catch" , IDENT , block_return ;
-block_return  = "{" , ( let_stmt | skip_stmt )* , return_stmt , "}" ;
+block_return  = "{" , ( let_stmt | skip_stmt | assert_stmt )* , return_stmt , "}" ;
 
 expression    = conditional_or ,
                 ( "if" , conditional_or , ( "else" , expression )? )? ;
@@ -229,7 +229,7 @@ Only the selected result is evaluated when its condition is unresolved. Conditio
 `for` is expression-only and returns an ordered list:
 
 ```runlet
-scores = for order in orders limit 12 {
+scores = for order in orders {
     return fraud.score(customer, order, limits)
 }
 ```
@@ -243,11 +243,17 @@ help: write `return fraud.score(customer, order, limits)`
 
 The collection must resolve to a finite list, object, or map. Lists iterate in index order. Objects and maps iterate as `{ key, value }` records in lexicographically sorted UTF-8 key order, ensuring replay determinism. Streams and unbounded iterators are not in version 1.
 
-`limit N` is a positive integer literal between 1 and the embedder's configured maximum. It bounds active iteration scopes, not merely individual tool calls. An iteration holds a permit from the time its first reachable node becomes runnable until its returned value succeeds, fails, or is cancelled. This prevents a loop body with multiple calls from multiplying concurrency unexpectedly. If omitted, the runtime uses a configurable safe default, recommended as 16; it never means unbounded.
+Concurrency is host policy, configured with `RuntimeBuilder::loop_concurrency`.
+Source programs cannot override it because agents do not know provider quotas,
+runtime load, or tool safety constraints. The configured value bounds active
+iteration scopes, not merely individual tool calls, and never means unbounded.
 
 Result order matches input order, independent of completion order. A failed iteration fails the loop node and cancels its unfinished sibling iterations unless a boundary inside the body catches the failure. A boundary outside the loop treats the complete loop as part of its attempt.
 
-Loop expansion is incremental: after the collection resolves, the runtime materializes at most `limit + prefetch` iteration scopes (recommended prefetch: `limit`) and adds more as permits become available. Thus a million-element input does not create a million live subgraphs. Graph event consumers still receive stable virtual iteration identities.
+Loop expansion is incremental: after the collection resolves, the runtime
+materializes work according to the host concurrency policy and adds more as
+capacity becomes available. Graph event consumers still receive stable virtual
+iteration identities.
 
 ### 2.7.1 `skip`
 
@@ -277,10 +283,9 @@ total = fold acc = 0 for order in orders {
 
 Each iteration binds a fresh accumulator (immutability is preserved — this is
 rebinding, not mutation) and the body's return becomes the next accumulator.
-An empty collection yields the initial value. There is no `limit`: iterations
-are sequential by definition (writing `limit N` on a fold is rejected with
-`RL1020` and a removal fix), which is the point — `fold` is the construct
-that pins order-dependence, exactly as `for` pins bounded concurrency and
+An empty collection yields the initial value. Iterations are sequential by
+definition, which is the point: `fold` is the construct that pins
+order-dependence, exactly as `for` pins host-bounded concurrency and
 `boundary` pins retry. Ordered effect chains and cursor pagination are
 expressible only here.
 
@@ -299,7 +304,16 @@ fold serializes work that a `for` loop would run concurrently.
 Named aggregate helpers (`list.sum` and friends) are deliberately absent:
 one way to express a reduction. See STDLIB.md.
 
-### 2.7.3 `fail`
+### 2.7.3 `assert`
+
+`assert(condition[, message])` is an eager statement that checks a runtime
+invariant without adding checked data to the program's return value. The
+condition must be Boolean (`RL2305` when statically known otherwise) and the
+optional message must be a string (`RL2317`). A false condition raises the
+non-retryable `ASSERTION_FAILED` error; prior tool effects are not rolled
+back.
+
+### 2.7.4 `fail`
 
 `fail(code, message[, details])` raises a catchable error, exactly like a
 failing tool call: same `ToolError`, same boundary ownership, span stamped
@@ -319,7 +333,7 @@ An error boundary is structured error handling for the reachable subgraph produc
 ```runlet
 report = boundary retry 2 {
     orders = shop.orders(customer.id)
-    scores = for order in orders limit 12 {
+    scores = for order in orders {
         return fraud.score(customer, order, limits)
     }
     return ai.summarize({ customer, orders, tickets, scores })
@@ -364,7 +378,7 @@ With the required loop `return` added:
 
 1. `crm.customer`, `billing.limits`, and `support.tickets` have resolved `customer_id` inputs, are reachable from `report`, and start concurrently.
 2. `shop.orders` is inside the boundary and waits for `customer.id`.
-3. When `orders` resolves, the loop expands incrementally. Up to 12 iteration scopes call `fraud.score`; each also depends on `customer` and `limits`.
+3. When `orders` resolves, the loop expands incrementally. Up to the host-configured number of iteration scopes call `fraud.score`; each also depends on `customer` and `limits`.
 4. The primary `ai.summarize` waits for the four values in its input object. It does not wait for unrelated graph nodes.
 5. A caught failure cancels remaining work owned by the boundary. Eligible retries replay the boundary subgraph without repeating its external dependencies.
 6. After retries are exhausted, the catch summary depends on `customer`, `tickets`, and the error, but not `orders`, `limits`, or `scores` except insofar as their failure produced the error.
@@ -805,7 +819,7 @@ time = now()
 github_tools = tool_search("github")
 linear_tools = tool_search("linear")
 
-rows = for tool in github_tools + linear_tools limit 10 {
+rows = for tool in github_tools + linear_tools {
     return { name: tool.name, arguments: tool.arguments, return_type: tool.return_type }
 }
 
@@ -968,7 +982,7 @@ An implementation is conforming only if these hold:
 1. **Dependency safety:** a node is dispatched only after all required data/control dependencies succeed and its input validates.
 2. **Reachability safety:** an effectful node not transitively reachable from the selected root is never dispatched.
 3. **Single selection:** at most one arm of a dynamic conditional is materialized.
-4. **Loop bound:** no more than `limit` iteration scopes of a loop are active.
+4. **Loop bound:** no more than the host-configured number of iteration scopes of a loop are active.
 5. **Boundary ownership:** retry/catch/cancellation affects only reachable lexically owned descendants.
 6. **Replay stability:** the same pinned source, registry, inputs, configuration, and journal prefix reconstruct the same logical graph and state.
 7. **Durable transition:** no externally observable state transition is published before its journal event commits.
@@ -1024,7 +1038,7 @@ Targets must be measured on named hardware and are not semantic promises. Initia
 - parse and analyze a 10 KiB program with 1,000 registry tools in under 10 ms warm;
 - maintain at least 100,000 materialized lightweight graph nodes per process with under 1 KiB runtime overhead per simple node excluding values/source/schema;
 - schedule dependency-ready local no-op calls at over 100,000 transitions/second using an in-memory journal;
-- keep loop live-node count O(limit + prefetch), independent of total input length; and
+- keep loop live-node count O(concurrency + prefetch), independent of total input length; and
 - add under 1 ms scheduler overhead to ordinary remote tool calls at the p50.
 
 Benchmarks must report journal durability mode; an fsync-backed path is expected to be storage-bound. Optimize only after profiles preserve the invariants and diagnostics.
@@ -1068,7 +1082,7 @@ Exit: security review, fault-injection soak tests, documented SLOs, and versione
 Decided for version 1:
 
 - Pure work is lazy and root-reachable; statements containing effectful calls are implicit roots, so bound fire-and-forget writes always run.
-- Loop bodies explicitly `return` or `skip`; the concurrency limit bounds whole iterations.
+- Loop bodies explicitly `return` or `skip`; host concurrency bounds whole iterations.
 - `for` pins bounded concurrency, `fold` pins sequential reduction, `boundary` pins retry: lambdas exist only at these controlled application sites and are never values.
 - `retry N` means N retries after the first attempt.
 - Conditions have no truthiness.
@@ -1098,7 +1112,7 @@ tickets = support.tickets(customer_id)
 report = boundary retry 2 {
     orders = shop.orders(customer.id)
 
-    scores = for order in orders limit 12 {
+    scores = for order in orders {
         return fraud.score(customer, order, limits)
     }
 

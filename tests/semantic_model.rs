@@ -194,7 +194,7 @@ fn conditional_effect_bindings_dispatch_only_selected_writes() {
         })
         .build()
         .unwrap();
-    let source = "flags = for id in [1, 2, 3, 4] limit 4 {\n  \
+    let source = "flags = for id in [1, 2, 3, 4] {\n  \
                   result = crm.update(id) if id > 2 else null\n  \
                   return id > 2\n}\nreturn flags";
     let execution = runtime.run(&runtime.compile(source).unwrap()).unwrap();
@@ -291,7 +291,7 @@ fn null_for_optional_property_means_omit_the_key() {
   { id: "CT-2", phone: "+14155550103", company: "Initech" },
   { id: "CT-3", phone: "+14155550104", company: "" }
 ]
-results = for contact in contacts limit 4 {
+results = for contact in contacts {
   phone = contact.phone
   needs_fix = not (text.length(phone) == 12 and "+1" in phone)
   needs_company = contact.company == ""
@@ -384,7 +384,7 @@ fn loops_are_ordered_and_boundaries_catch_failures() {
         })
         .build()
         .unwrap();
-    let source = "result = boundary {\n values = for item in [1, 2, 3] limit 2 { return work(item) }\n return values\n} catch err { return [err.code] }\nreturn result";
+    let source = "result = boundary {\n values = for item in [1, 2, 3] { return work(item) }\n return values\n} catch err { return [err.code] }\nreturn result";
     let execution = runtime.run(&runtime.compile(source).unwrap()).unwrap();
     assert_eq!(execution.value, CanonicalValue::List(vec!["BOOM".into()]));
 }
@@ -468,7 +468,7 @@ fn conversions_and_short_circuiting_are_observable() {
 }
 
 #[test]
-fn loop_limits_bound_parallel_execution_and_stream_graph_events() {
+fn host_loop_concurrency_bounds_parallel_execution_and_streams_graph_events() {
     let mut registry = ToolRegistry::new();
     registry
         .register(descriptor("slow", vec![Schema::INTEGER], Schema::INTEGER))
@@ -477,6 +477,7 @@ fn loop_limits_bound_parallel_execution_and_stream_graph_events() {
     let maximum = Arc::new(AtomicUsize::new(0));
     let runtime = Runtime::builder()
         .registry(registry)
+        .loop_concurrency(3)
         .tool("slow", {
             let active = active.clone();
             let maximum = maximum.clone();
@@ -491,7 +492,7 @@ fn loop_limits_bound_parallel_execution_and_stream_graph_events() {
         .build()
         .unwrap();
     let program = runtime
-        .compile("values = for x in [1, 2, 3, 4, 5, 6] limit 3 { return slow(x) }\nreturn values")
+        .compile("values = for x in [1, 2, 3, 4, 5, 6] { return slow(x) }\nreturn values")
         .unwrap();
     let events = Arc::new(Mutex::new(Vec::new()));
     let execution = runtime
@@ -611,7 +612,7 @@ fn agent_style_programs_with_unions_and_constrained_schemas_compile() {
 page1 = list_orders({ status: "open", page: 1 })
 page2 = list_orders({ status: "open", page: 2 })
 extra = page2 if page1.total_pages > 1 else { items: [], total_pages: 1 }
-amounts = for order in page1.items + extra.items limit 8 {
+amounts = for order in page1.items + extra.items {
     detail = get_order({ id: order.id })
     return detail.amount_cents if detail.amount_cents > 0 else 0
 }
@@ -659,7 +660,7 @@ fn deeply_nested_unions_stay_bounded() {
     for depth in 0..24 {
         let name = format!("level{depth}");
         source.push_str(&format!(
-            "{name} = for item in {previous} limit 4 {{\n\
+            "{name} = for item in {previous} {{\n\
                  detail = fetch({{ id: 1 }})\n\
                  branch = detail if detail.value > 0 else {{ value: {depth} }}\n\
                  return [branch] if detail.value > {depth} else []\n\
@@ -726,7 +727,7 @@ fn prelude_enables_filter_and_aggregate() {
         .unwrap();
 
     let source = r#"
-amounts = for id in ids limit 4 {
+amounts = for id in ids {
     detail = get_order({ id: id })
     skip if not ("completed" in text.lower(detail.status))
     return detail.amount_cents
@@ -766,10 +767,10 @@ fn chained_lazy_loop_bindings_evaluate_linearly() {
         .unwrap();
 
     let depth = 9;
-    let mut source = String::from("l0 = for i in [1, 2, 3] limit 3 { v = fetch(i)\n return v }\n");
+    let mut source = String::from("l0 = for i in [1, 2, 3] { v = fetch(i)\n return v }\n");
     for level in 1..depth {
         source.push_str(&format!(
-            "l{level} = for i in [1, 2, 3] limit 3 {{ return l{}[0] + i }}\n",
+            "l{level} = for i in [1, 2, 3] {{ return l{}[0] + i }}\n",
             level - 1
         ));
     }
@@ -818,6 +819,27 @@ fn deeply_nested_source_is_rejected_at_parse_time() {
 }
 
 #[test]
+fn unknown_property_diagnostic_names_the_value_type() {
+    // The trained-habit collision: `.items` projected on a value that is
+    // already the list. The message must say what the value IS so the model
+    // can repair in one attempt instead of guessing.
+    let runtime = Runtime::builder().build().unwrap();
+    let diagnostics = runtime
+        .compile("services = [\"a\", \"b\"]\nreturn services.items")
+        .unwrap_err();
+    let diagnostic = diagnostics
+        .iter()
+        .find(|d| d.code == "RL2103")
+        .unwrap_or_else(|| panic!("expected RL2103, got {diagnostics:#?}"));
+    assert!(
+        diagnostic.message.contains("of type string[]")
+            && diagnostic.message.contains("iterate or index the list itself"),
+        "message must name the type and the repair: {}",
+        diagnostic.message
+    );
+}
+
+#[test]
 fn dispatch_limit_bounds_active_tool_executions() {
     let mut registry = ToolRegistry::new();
     registry
@@ -840,7 +862,7 @@ fn dispatch_limit_bounds_active_tool_executions() {
         .build()
         .unwrap();
     let program = runtime
-        .compile("out = for i in [1, 2, 3, 4, 5, 6, 7, 8] limit 8 { return slow(i) }\nreturn out")
+        .compile("out = for i in [1, 2, 3, 4, 5, 6, 7, 8] { return slow(i) }\nreturn out")
         .unwrap_or_else(|d| panic!("{d:#?}"));
     let execution = runtime.run(&program).unwrap();
     let CanonicalValue::List(values) = execution.value else {
@@ -873,9 +895,9 @@ fn nested_cross_product_loops_degrade_to_sequential_under_thread_budget() {
         .build()
         .unwrap();
     let source = "
-pairs = for a in [1, 2, 3, 4, 5, 6, 7, 8] limit 8 {
-    inner = for b in [1, 2, 3, 4, 5, 6, 7, 8] limit 8 {
-        deepest = for c in [1, 2] limit 2 {
+pairs = for a in [1, 2, 3, 4, 5, 6, 7, 8] {
+    inner = for b in [1, 2, 3, 4, 5, 6, 7, 8] {
+        deepest = for c in [1, 2] {
             return probe(c)
         }
         return (fold s = 0 for d in deepest { return s + d }) + b
@@ -896,7 +918,7 @@ fn parser_error_recovery_always_makes_progress() {
     // recovery stuck on the trailing `}`, looping forever and accumulating
     // gigabytes of diagnostics. Recovery must terminate quickly with a
     // bounded diagnostic list, and prefix `if` gets a targeted hint.
-    let source = "x = list.flatten(for p in [1] limit 1 { return if p then 1 else 2 })\nreturn x";
+    let source = "x = list.flatten(for p in [1] { return if p then 1 else 2 })\nreturn x";
     let diagnostics = parse(source).unwrap_err();
     assert!(
         diagnostics.len() < 32,
@@ -930,8 +952,8 @@ fn bindings_used_inside_nested_block_statements_are_reachable() {
         .unwrap();
     let source = "
 companies = list_companies({})
-mapped = for x in [1, 2] limit 2 {
-    inner = for c in companies.items limit 2 {
+mapped = for x in [1, 2] {
+    inner = for c in companies.items {
         return c
     }
     return inner
@@ -1042,7 +1064,7 @@ fn fold_accumulator_must_keep_one_schema() {
 #[test]
 fn skip_filters_for_loop_elements_in_order() {
     let runtime = Runtime::builder().build().unwrap();
-    let source = "evens = for x in [1, 2, 3, 4, 5, 6] limit 3 {\n  \
+    let source = "evens = for x in [1, 2, 3, 4, 5, 6] {\n  \
                   skip if x % 2 == 1\n  return x\n}\nreturn evens";
     let execution = runtime.run(&runtime.compile(source).unwrap()).unwrap();
     assert_eq!(
@@ -1064,11 +1086,72 @@ fn skip_is_rejected_outside_loops_and_across_boundaries() {
     assert!(top.iter().any(|d| d.code == "RL1018"), "{top:#?}");
     let crossing = runtime
         .compile(
-            "x = for v in [1] limit 1 {\n  y = boundary {\n    skip\n    return 1\n  } \
+            "x = for v in [1] {\n  y = boundary {\n    skip\n    return 1\n  } \
              catch err {\n    return 2\n  }\n  return y\n}\nreturn x",
         )
         .expect_err("skip inside a boundary must be rejected");
     assert!(crossing.iter().any(|d| d.code == "RL1018"), "{crossing:#?}");
+}
+
+#[test]
+fn assertions_force_checks_without_returning_intermediate_values() {
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(descriptor("count_items", vec![], Schema::INTEGER))
+        .unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let runtime = Runtime::builder()
+        .registry(registry)
+        .tool("count_items", {
+            let calls = calls.clone();
+            move |_, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(CanonicalValue::Integer(3))
+            }
+        })
+        .build()
+        .unwrap();
+
+    let source =
+        "count = count_items()\nassert(count == 3, \"unexpected item count\")\nreturn { ok: true }";
+    let execution = runtime.run(&runtime.compile(source).unwrap()).unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        execution.value,
+        CanonicalValue::Object(BTreeMap::from([(
+            "ok".into(),
+            CanonicalValue::Boolean(true)
+        )]))
+    );
+
+    let failing = "assert(false, \"items are missing\")\nreturn true";
+    let error = runtime
+        .run(&runtime.compile(failing).unwrap())
+        .expect_err("false assertion must fail");
+    assert_eq!(error.code, "ASSERTION_FAILED");
+    assert_eq!(error.message, "items are missing");
+    let span = error.span.expect("assertion failure carries its span");
+    assert_eq!(
+        &failing[span.start..span.end],
+        "assert(false, \"items are missing\")"
+    );
+}
+
+#[test]
+fn assertion_inputs_are_checked_statically() {
+    let runtime = Runtime::builder().build().unwrap();
+    let diagnostics = runtime
+        .compile("assert(1, false)\nreturn true")
+        .expect_err("assertion inputs must have the right schemas");
+    assert!(diagnostics.iter().any(|d| d.code == "RL2305"));
+    assert!(diagnostics.iter().any(|d| d.code == "RL2317"));
+    runtime
+        .compile("m = \"text\" if true else 4\nassert(true, m)\nreturn true")
+        .expect("a union carrying a string variant defers to runtime");
+    let stringless_union = runtime
+        .compile("m = 3 if true else 4.5\nassert(true, m)\nreturn true")
+        .expect_err("a union with no string variant is rejected statically");
+    assert!(stringless_union.iter().any(|d| d.code == "RL2317"));
 }
 
 #[test]
@@ -1267,13 +1350,15 @@ return {
     missing_last: ranked[2].id,
     top: top[0].id,
     window: list.slice([1, 2, 3, 4, 5], 1, -1),
-    pages: list.range(1, 4)
+    pages: list.range(1, 4),
+    stepped: list.range(540, 961, 30),
+    down: list.range(3, 0, -1)
 }
 "#;
     let execution = runtime.run(&runtime.compile(source).unwrap()).unwrap();
     assert_eq!(
         execution.value.presentation_json().unwrap(),
-        "{\"first\":\"o2\",\"missing_last\":\"o3\",\"names\":[\"a\",\"b\"],\"pages\":[1,2,3],\"sorted\":[1,2,3],\"top\":\"o1\",\"window\":[2,3,4]}"
+        "{\"down\":[3,2,1],\"first\":\"o2\",\"missing_last\":\"o3\",\"names\":[\"a\",\"b\"],\"pages\":[1,2,3],\"sorted\":[1,2,3],\"stepped\":[540,570,600,630,660,690,720,750,780,810,840,870,900,930,960],\"top\":\"o1\",\"window\":[2,3,4]}"
     );
     let mixed = runtime
         .compile("return list.sort([1, \"a\"])")
@@ -1281,6 +1366,23 @@ return {
         .expect("mixed kinds defer to runtime")
         .expect_err("mixed kinds must fail");
     assert_eq!(mixed.code, "RL5201");
+    let zero_step = runtime
+        .compile("return list.range(0, 10, 0)")
+        .map(|p| runtime.run(&p))
+        .expect("zero step defers to runtime")
+        .expect_err("zero step must fail");
+    assert_eq!(zero_step.code, "RL5214");
+    let near_max = runtime
+        .run(
+            &runtime
+                .compile("return list.range(9223372036854775800, 9223372036854775807, 100)")
+                .unwrap(),
+        )
+        .expect("a range ending at the integer boundary must not overflow");
+    assert_eq!(
+        near_max.value.presentation_json().unwrap(),
+        "[9223372036854775800]"
+    );
 }
 
 #[test]
@@ -1302,7 +1404,7 @@ return {
     let execution = runtime.run(&runtime.compile(source).unwrap()).unwrap();
     assert_eq!(
         execution.value.presentation_json().unwrap(),
-        "{\"a1\":2.5,\"b\":\"x\",\"day_text\":\"2026-07-12T00:00:00.000Z\",\"encoded\":\"{\\\"z\\\":true}\",\"t\":1783841400250,\"t_text\":\"2026-07-12T07:30:00.250Z\"}"
+        "{\"a1\":2.5,\"b\":\"x\",\"day_text\":\"2026-07-12T00:00:00Z\",\"encoded\":\"{\\\"z\\\":true}\",\"t\":1783841400250,\"t_text\":\"2026-07-12T07:30:00.250Z\"}"
     );
     let bad = runtime
         .compile("return time.parse(\"tomorrow\")")
@@ -1522,34 +1624,10 @@ fn runtime_errors_inside_loop_iterations_keep_their_spans() {
         )
         .build()
         .unwrap();
-    let source = "out = for x in input.xs limit 2 {\n    return x[0]\n}\nreturn out";
+    let source = "out = for x in input.xs {\n    return x[0]\n}\nreturn out";
     let program = runtime.compile(source).unwrap();
     let error = runtime.run(&program).expect_err("indexing null fails");
     assert_eq!(error.code, "RL5203");
     let span = error.span.expect("loop-iteration errors carry spans");
     assert_eq!(&source[span.start..span.end], "x[0]");
-}
-
-#[test]
-fn fold_with_a_limit_gets_one_targeted_diagnostic() {
-    let runtime = Runtime::builder().build().unwrap();
-    let source = "
-xs = [1, 2, 3]
-total = fold acc = 0 for x in xs limit 8 {
-    return acc + x
-}
-return total
-";
-    let diagnostics = runtime
-        .compile(source)
-        .expect_err("fold has no limit clause");
-    let errors: Vec<_> = diagnostics
-        .iter()
-        .filter(|d| d.severity == Severity::Error)
-        .collect();
-    assert_eq!(errors.len(), 1, "one construct-level error: {errors:#?}");
-    assert_eq!(errors[0].code, "RL1020");
-    let fix = errors[0].fixes.first().expect("has a removal fix");
-    assert_eq!(fix.replacement, "");
-    assert_eq!(&source[fix.span.start..fix.span.end], "limit 8");
 }

@@ -13,7 +13,7 @@ result.
 issues = linear.search_issues({ assignee: user, state: "open" })
 pulls = github.search_pull_requests({ author: user, state: "open" })
 
-pulls_with_checks = for pull in pulls limit 8 {
+pulls_with_checks = for pull in pulls {
     checks = github.checks(pull.number)
     return {
         number: pull.number,
@@ -29,8 +29,8 @@ return {
 ```
 
 There is no `async` or `await`. References create data dependencies: the
-Linear and GitHub searches can start together, each checks lookup starts when
-its pull request is available, and `limit 8` bounds the fan-out. Only work that
+Linear and GitHub searches can start together, and each checks lookup starts
+when its pull request is available. The host bounds fan-out; only work that
 contributes to the returned value runs.
 
 ## Why a language for tool composition?
@@ -79,7 +79,7 @@ inspectable execution graph built into the language.
 | Keep programs easy for models to produce | The language has bindings, expressions, objects, lists, `for`, conditionals, boundaries, and `return`—but no imports, classes, functions, threads, or visible type syntax. |
 | Catch mistakes before tools run | The host registers every tool with input and output schemas. The analyzer checks names, calls, projections, operators, branches, and returned values. |
 | Avoid accidental effects, keep intended ones | Pure work is lazy and root-reachable: an unused pure computation is pruned with a warning, never dispatched. Statements containing effectful calls are implicit roots — a fire-and-forget write always runs when its block runs. |
-| Bound dynamic work | `for ... limit N` caps active iterations while preserving result order. |
+| Bound dynamic work | The host caps active `for` iterations while preserving result order. |
 | Make failure handling explicit | `boundary retry N { ... } catch err { ... }` owns a subgraph, retries retryable failures, and produces a normal fallback value. |
 | Let hosts retain control | The embedder supplies the complete tool registry, implementations, schemas, execution policies, and external inputs. |
 | Make execution observable | The runtime emits ordered graph events for nodes, dependencies, attempts, failures, recoveries, and results. |
@@ -92,7 +92,7 @@ Runlet programs are immutable expressions ending in one `return`:
 customer = crm.get_customer(customer_id)
 orders = commerce.list_orders({ customer_id: customer.id })
 
-enriched = for order in orders limit 12 {
+enriched = for order in orders {
     result = boundary retry 2 {
         return risk.score({ customer, order })
     } catch err {
@@ -127,12 +127,15 @@ The main rules are deliberately compact:
   `else` is optional and defaults to `null`. For larger branches,
   `if cond { ... } else { ... }` is the block-bodied expression form — each
   branch ends with `return`.
-- `for item in items limit N { ... }` returns an ordered list; `skip if
+- `for item in items { ... }` returns an ordered list with host-bounded
+  concurrency; `skip if
   condition` drops an element.
 - `fold acc = init for item in items { ... }` reduces sequentially; the
   body's `return` becomes the next accumulator.
 - `boundary retry N { ... } catch err { ... }` turns a failed subgraph into a
   fallback value; `fail(code, message)` raises one.
+- `assert(condition, message)` checks an invariant without returning its
+  intermediate values.
 - Tool namespaces such as `crm.get_customer` come entirely from the host.
 - A small pure intrinsic library (`text.*`, `regex.*`, `list.*`, `json.*`,
   `number.*`, `time.*`) covers data shaping; see [`STDLIB.md`](STDLIB.md).

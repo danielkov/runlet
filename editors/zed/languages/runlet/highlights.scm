@@ -10,7 +10,6 @@
   "return"
   "for"
   "in"
-  "limit"
   "boundary"
   "retry"
   "catch"
@@ -18,6 +17,7 @@
   "else"
   "fold"
   "skip"
+  "assert"
   "fail"
 ] @keyword
 

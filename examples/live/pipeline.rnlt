@@ -1,6 +1,6 @@
 # A miniature multi-region data pipeline. There is deliberately no `async` or
-# `await`: dependencies come from ordinary value references. Each loop's limit
-# is the maximum number of its iteration subgraphs that may run concurrently.
+# `await`: dependencies come from ordinary value references. The host limits
+# how many iteration subgraphs may run concurrently.
 
 regions = [
     { name: "eu-west", sources: ["accounts", "orders", "events"] },
@@ -13,8 +13,8 @@ regions = [
 
 # Three regions are active at once. Within each region all three source chains
 # fan out. Every chain is long and sequential, but independent chains overlap.
-regional_snapshots = for region in regions limit 3 {
-    source_snapshots = for source in region.sources limit 3 {
+regional_snapshots = for region in regions {
+    source_snapshots = for source in region.sources {
         fetched = demo.task(
             "fetch " + region.name + "/" + source,
             1800 if source == "events" else 1400,

@@ -250,8 +250,11 @@ pub(crate) fn entries() -> Vec<(ToolDescriptor, PreludeHandler)> {
         (
             descriptor(
                 "list.range",
-                "Integers from start (inclusive) to end (exclusive): list.range(1, 4) is [1, 2, 3].",
-                CallSchema::positional(vec![Schema::INTEGER, Schema::INTEGER]),
+                "Integers from start (inclusive) to end (exclusive), by an optional step: list.range(1, 4) is [1, 2, 3]; list.range(0, 90, 30) is [0, 30, 60]. A negative step counts down.",
+                CallSchema::optional_trailing(
+                    vec![Schema::INTEGER, Schema::INTEGER, Schema::INTEGER],
+                    2,
+                ),
                 Schema::list(Schema::INTEGER),
             ),
             list_range,
@@ -712,14 +715,37 @@ fn list_slice(args: &[V], _: &ToolContext) -> Result<V, ToolError> {
 
 fn list_range(args: &[V], _: &ToolContext) -> Result<V, ToolError> {
     let (start, end) = (integer_arg(args, 0)?, integer_arg(args, 1)?);
-    let length = end.saturating_sub(start).max(0);
-    if length > RANGE_CAP {
+    let step = args.get(2).map(|_| integer_arg(args, 2)).transpose()?;
+    let step = step.unwrap_or(1);
+    if step == 0 {
+        return Err(err("RL5214", "list.range step cannot be 0".to_string()));
+    }
+    let span = if step > 0 {
+        end.saturating_sub(start)
+    } else {
+        start.saturating_sub(end)
+    }
+    .max(0) as u64;
+    let magnitude = step.unsigned_abs();
+    let length = span.div_ceil(magnitude);
+    if length > RANGE_CAP as u64 {
         return Err(err(
             "RL5201",
             format!("list.range produces {length} elements; the cap is {RANGE_CAP}"),
         ));
     }
-    Ok(V::List((start..end).map(V::Integer).collect()))
+    let mut out = Vec::with_capacity(length as usize);
+    let mut x = start;
+    while if step > 0 { x < end } else { x > end } {
+        out.push(V::Integer(x));
+        // The step past the final element can leave i64; every pushed value
+        // is in range, so overflow just ends the range.
+        match x.checked_add(step) {
+            Some(next) => x = next,
+            None => break,
+        }
+    }
+    Ok(V::List(out))
 }
 
 // json ----------------------------------------------------------------------
@@ -954,8 +980,15 @@ fn time_format(args: &[V], _: &ToolContext) -> Result<V, ToolError> {
         ));
     }
     let (second_of_day, ms) = (in_day / 1_000, in_day % 1_000);
+    // Whole seconds render without a fractional part: `14:00:00Z`, not
+    // `14:00:00.000Z` — the form APIs and humans expect back.
+    let fraction = if ms == 0 {
+        String::new()
+    } else {
+        format!(".{ms:03}")
+    };
     Ok(V::String(format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{ms:03}Z",
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}{fraction}Z",
         second_of_day / 3_600,
         second_of_day % 3_600 / 60,
         second_of_day % 60,

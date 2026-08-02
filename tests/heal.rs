@@ -37,7 +37,7 @@ return flag
 fn bare_final_expression_and_bare_statement_heal() {
     // `{ expr }` blocks (Rust habit) and fire-and-forget bare calls.
     let source = "
-doubled = for x in [1, 2] limit 2 {
+doubled = for x in [1, 2] {
     y = x * 2
     y
 }

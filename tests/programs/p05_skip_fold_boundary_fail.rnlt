@@ -1,12 +1,12 @@
 #! expect: { "open_total": 350, "guard": "EMPTY" }
 orders = data.orders()
-open_amounts = for o in orders limit 4 {
+open_amounts = for o in orders {
     skip if o.status != "open"
     return o.amount_cents
 }
 open_total = fold acc = 0 for a in open_amounts { return acc + a }
 guard = boundary retry 2 {
-    voided = for o in orders limit 4 {
+    voided = for o in orders {
         skip if o.status != "void"
         return o
     }

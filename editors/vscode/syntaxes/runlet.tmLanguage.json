@@ -75,7 +75,7 @@
     },
     "keywords": {
       "name": "keyword.control.runlet",
-      "match": "\\b(?:return|for|in|limit|boundary|retry|catch|if|else|fold|skip|fail)\\b"
+      "match": "\\b(?:return|for|in|boundary|retry|catch|if|else|fold|skip|assert|fail)\\b"
     },
     "word-operators": {
       "name": "keyword.operator.logical.runlet",

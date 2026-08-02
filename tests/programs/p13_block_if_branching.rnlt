@@ -4,7 +4,7 @@
 # gating (only the selected branch's write dispatches), and the optional
 # else defaulting to null inside a keyed fold.
 orders = data.orders()
-tiers = for o in orders limit 4 {
+tiers = for o in orders {
     tier = if o.customer.tier >= 3 {
         flagged = write.update({ id: o.id, company: "priority-desk" })
         return "vip"

@@ -20,7 +20,8 @@ module.exports = grammar({
   word: ($) => $.identifier,
 
   rules: {
-    source_file: ($) => seq(repeat($.binding_statement), $.return_statement),
+    source_file: ($) =>
+      seq(repeat(choice($.binding_statement, $.assert_statement)), $.return_statement),
 
     binding_statement: ($) =>
       seq(field("name", $.identifier), "=", field("value", $._expression), optional(";")),
@@ -30,13 +31,23 @@ module.exports = grammar({
     block: ($) =>
       seq(
         "{",
-        repeat(choice($.binding_statement, $.skip_statement)),
+        repeat(choice($.binding_statement, $.skip_statement, $.assert_statement)),
         $.return_statement,
         "}",
       ),
 
     skip_statement: ($) =>
       seq("skip", optional(seq("if", field("condition", $._expression))), optional(";")),
+
+    assert_statement: ($) =>
+      seq(
+        "assert",
+        "(",
+        field("condition", $._expression),
+        optional(seq(",", field("message", $._expression))),
+        ")",
+        optional(";"),
+      ),
 
     _expression: ($) =>
       choice(
@@ -131,7 +142,6 @@ module.exports = grammar({
         field("binding", $.identifier),
         "in",
         field("collection", $._expression),
-        optional(seq("limit", field("limit", $.integer))),
         field("body", $.block),
       ),
 
@@ -207,8 +217,8 @@ module.exports = grammar({
     field_name: ($) =>
       choice(
         $.identifier,
-        "return", "for", "in", "limit", "boundary", "retry", "catch", "if", "else",
-        "fold", "skip", "fail", "and", "or", "not", "null", "true", "false",
+        "return", "for", "in", "boundary", "retry", "catch", "if", "else",
+        "fold", "skip", "assert", "fail", "and", "or", "not", "null", "true", "false",
       ),
     identifier: (_) => /[_\p{L}][_\p{L}\p{M}\p{N}]*/,
     null: (_) => "null",

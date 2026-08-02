@@ -249,6 +249,58 @@ impl Schema {
             max_len: None,
         }
     }
+    /// Compact human-readable type notation, for diagnostics: `string`,
+    /// `int[]`, `{ id: string, total?: int }`, `"a" | "b"`,
+    /// `{ [key]: number }`. Deliberately lossy — bounds and formats are
+    /// omitted; nesting deeper than two levels collapses to kind names.
+    pub fn type_notation(&self) -> String {
+        self.notation(0)
+    }
+
+    fn notation(&self, depth: usize) -> String {
+        const MAX_DEPTH: usize = 2;
+        match self {
+            Self::Integer { .. } => "int".to_string(),
+            Self::String { enumeration, .. } if !enumeration.is_empty() => enumeration
+                .iter()
+                .map(|v| format!("\"{v}\""))
+                .collect::<Vec<_>>()
+                .join(" | "),
+            Self::List { items, .. } => match items.as_ref() {
+                Self::Object { .. } | Self::Union { .. } if depth < MAX_DEPTH => {
+                    format!("{}[]", items.notation(depth + 1))
+                }
+                Self::Object { .. } | Self::Union { .. } => "object[]".to_string(),
+                other => format!("{}[]", other.notation(depth + 1)),
+            },
+            Self::Object {
+                properties,
+                required,
+                ..
+            } => {
+                if depth >= MAX_DEPTH || properties.is_empty() {
+                    return "object".to_string();
+                }
+                let fields = properties
+                    .iter()
+                    .map(|(name, property)| {
+                        let optional = if required.contains(name) { "" } else { "?" };
+                        format!("{name}{optional}: {}", property.schema.notation(depth + 1))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{{ {fields} }}")
+            }
+            Self::Map { values } => format!("{{ [key]: {} }}", values.notation(depth + 1)),
+            Self::Union { variants, .. } => variants
+                .iter()
+                .map(|v| v.notation(depth + 1))
+                .collect::<Vec<_>>()
+                .join(" | "),
+            other => other.kind_name().to_string(),
+        }
+    }
+
     /// Short lowercase name of the schema's kind, for diagnostics.
     pub fn kind_name(&self) -> &'static str {
         match self {

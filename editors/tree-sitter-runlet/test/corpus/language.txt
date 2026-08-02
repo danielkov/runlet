@@ -31,7 +31,8 @@ return {profile, customer: customer.email}
 Control expressions
 ==================
 
-rows = for item in items limit 3 { return item.value * 2 }
+rows = for item in items { return item.value * 2 }
+assert(rows != [], "expected rows")
 safe = boundary retry 2 { return 1 / divisor } catch err { return err.code }
 return safe if enabled and true else rows
 
@@ -43,12 +44,14 @@ return safe if enabled and true else rows
     value: (for_expression
       binding: (identifier)
       collection: (identifier)
-      limit: (integer)
       body: (block
         (return_statement
           (binary_expression
             left: (member_expression object: (identifier) property: (field_name (identifier)))
             right: (integer))))))
+  (assert_statement
+    condition: (binary_expression left: (identifier) right: (list))
+    message: (string))
   (binding_statement
     name: (identifier)
     value: (boundary_expression

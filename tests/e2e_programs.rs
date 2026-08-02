@@ -263,7 +263,7 @@ fn corpus_programs_run_end_to_end() {
 #[test]
 fn block_constructs_parse_inside_every_grouping_context() {
     let blocks = [
-        "for x in [1, 2] limit 2 {\n  y = x * 2\n  skip if y > 3\n  return y\n}",
+        "for x in [1, 2] {\n  y = x * 2\n  skip if y > 3\n  return y\n}",
         "fold acc = 0 for x in [1, 2] {\n  y = x * 2\n  return acc + y\n}",
         "boundary retry 2 {\n  v = 1\n  return v\n} catch err {\n  w = 0\n  return w\n}",
         "if 1 > 0 {\n  y = 1\n  return y\n} else if 2 > 1 {\n  return 2\n} else {\n  z = 0\n  return z\n}",
@@ -287,7 +287,7 @@ fn block_constructs_parse_inside_every_grouping_context() {
         ),
         (
             "nested loop body",
-            "value = for outer in [1] limit 1 {\n  inner = {B}\n  return inner\n}\nreturn value",
+            "value = for outer in [1] {\n  inner = {B}\n  return inner\n}\nreturn value",
         ),
         (
             "fold body",

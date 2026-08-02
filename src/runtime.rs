@@ -81,8 +81,7 @@ pub struct Runtime {
     registry: ToolRegistry,
     handlers: BTreeMap<String, Handler>,
     inputs: BTreeMap<String, (Schema, V)>,
-    default_loop_limit: u32,
-    max_loop_limit: u32,
+    loop_concurrency: u32,
     max_graph_nodes: usize,
     max_eval_depth: usize,
     max_active_dispatches: usize,
@@ -150,8 +149,7 @@ impl Runtime {
                 registry: ToolRegistry::new(),
                 handlers: BTreeMap::new(),
                 inputs: BTreeMap::new(),
-                default_loop_limit: 16,
-                max_loop_limit: 1024,
+                loop_concurrency: 16,
                 max_graph_nodes: 250_000,
                 max_eval_depth: 512,
                 max_active_dispatches: 64,
@@ -290,10 +288,9 @@ impl RuntimeBuilder {
         self.runtime.handlers.insert(name.into(), Arc::new(handler));
         self
     }
-    /// Sets the implicit loop limit and the maximum explicit loop limit.
-    pub fn loop_limits(mut self, default: u32, max: u32) -> Self {
-        self.runtime.default_loop_limit = default;
-        self.runtime.max_loop_limit = max;
+    /// Sets the host-owned concurrency used by every `for` loop.
+    pub fn loop_concurrency(mut self, concurrency: u32) -> Self {
+        self.runtime.loop_concurrency = concurrency.max(1);
         self
     }
     /// Caps the total number of execution graph nodes a run may create.
@@ -718,15 +715,8 @@ impl Evaluator<'_> {
             ExprKind::For {
                 binding,
                 collection,
-                limit,
                 body,
-            } => self.loop_expr(
-                e.span,
-                binding,
-                collection,
-                limit.unwrap_or(self.runtime.default_loop_limit),
-                body,
-            ),
+            } => self.loop_expr(e.span, binding, collection, body),
             ExprKind::Fold {
                 accumulator,
                 init,
@@ -1081,13 +1071,14 @@ impl Evaluator<'_> {
         span: Span,
         binding: &str,
         collection: &Expr,
-        limit: u32,
         body: &Block,
     ) -> Result<V, ToolError> {
-        if limit == 0 || limit > self.runtime.max_loop_limit {
-            return Err(lang("RL4102", "loop limit outside host policy"));
-        }
-        let node = self.node(NodeKind::Loop, format!("for limit {limit}"), span)?;
+        let concurrency = self.runtime.loop_concurrency;
+        let node = self.node(
+            NodeKind::Loop,
+            format!("for concurrency {concurrency}"),
+            span,
+        )?;
         let c = self.eval(collection)?;
         let values = match c {
             V::List(x) => x,
@@ -1117,7 +1108,7 @@ impl Evaluator<'_> {
         // concurrently.
         let next = Arc::new(AtomicUsize::new(1));
         let results = Arc::new(Mutex::new(vec![None; values.len()]));
-        let worker_count = (limit as usize).min(values.len().saturating_sub(1));
+        let worker_count = (concurrency as usize).min(values.len().saturating_sub(1));
         // Iterations share one cache of outer bindings they force, so a
         // binding referenced only inside the body evaluates once, not once
         // per iteration (see [`BindingCache`]).
@@ -1326,6 +1317,49 @@ impl Evaluator<'_> {
                         e.span = Some(s.span);
                         return Err(e);
                     }
+                }
+                crate::StmtKind::Assert { condition, message } => {
+                    let node = self.node(NodeKind::Branch, "assert", s.span)?;
+                    let result = match self.eval(condition) {
+                        Ok(V::Boolean(true)) => Ok(V::Null),
+                        Ok(V::Boolean(false)) => {
+                            let message = match message {
+                                Some(message) => match self.eval(message)? {
+                                    V::String(message) => message,
+                                    other => {
+                                        let mut error = lang(
+                                            "RL5201",
+                                            &format!(
+                                                "assert message must be a string, got {}",
+                                                value_kind(&other)
+                                            ),
+                                        );
+                                        error.span = Some(message.span);
+                                        return Err(error);
+                                    }
+                                },
+                                None => "assertion failed".into(),
+                            };
+                            let mut error = ToolError::new("ASSERTION_FAILED", message);
+                            error.span = Some(s.span);
+                            Err(error)
+                        }
+                        Ok(other) => {
+                            let mut error = lang(
+                                "RL5202",
+                                &format!(
+                                    "assert condition evaluated to {}; conditions must be \
+                                     true or false — Runlet has no truthiness, compare \
+                                     explicitly (e.g. `value != null`)",
+                                    value_kind(&other)
+                                ),
+                            );
+                            error.span = Some(condition.span);
+                            Err(error)
+                        }
+                        Err(error) => Err(error),
+                    };
+                    self.finish(node, result)?;
                 }
                 crate::StmtKind::Binding { name, value } => {
                     if crate::analyzer::contains_effectful_call(value, &self.runtime.registry) {

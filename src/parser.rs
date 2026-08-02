@@ -97,6 +97,9 @@ impl Parser {
         if self.at(&T::Skip) {
             return self.skip_stmt();
         }
+        if self.at(&T::Assert) {
+            return self.assert_stmt();
+        }
         let (name, start) = match self.current().kind.clone() {
             T::Ident(s) => {
                 let sp = self.bump().span;
@@ -112,7 +115,7 @@ impl Parser {
                     }
                     _ => {
                         "control structures are expressions; bind the result \
-                         to a name: `results = for item in items limit 8 { ... }`"
+                         to a name: `results = for item in items { ... }`"
                     }
                 };
                 self.diagnostics.push(Diagnostic::error(
@@ -168,6 +171,21 @@ impl Parser {
         Some(Stmt {
             span: start.join(end),
             kind: StmtKind::Skip { condition },
+        })
+    }
+    fn assert_stmt(&mut self) -> Option<Stmt> {
+        let start = self.bump().span;
+        self.expect_take(&T::LParen, "`(` after `assert`")?;
+        let condition = self.expr(0)?;
+        let message = if self.take(&T::Comma) {
+            Some(self.expr(0)?)
+        } else {
+            None
+        };
+        let end = self.expect_take(&T::RParen, "`)` after assertion")?.span;
+        Some(Stmt {
+            span: start.join(end),
+            kind: StmtKind::Assert { condition, message },
         })
     }
     fn block(&mut self) -> Option<Block> {
@@ -602,25 +620,12 @@ impl Parser {
         };
         self.expect_take(&T::In, "`in`")?;
         let collection = Box::new(self.expr(0)?);
-        let limit = if self.take(&T::Limit) {
-            match self.bump().kind.clone() {
-                T::Integer(s) => s.parse().ok(),
-                _ => {
-                    self.diagnostics
-                        .push(self.expected("positive integer loop limit"));
-                    None
-                }
-            }
-        } else {
-            None
-        };
         let body = self.loop_body()?;
         Some(Expr {
             span: start.join(body.span),
             kind: ExprKind::For {
                 binding,
                 collection,
-                limit,
                 body,
             },
         })
@@ -648,26 +653,6 @@ impl Parser {
         };
         self.expect_take(&T::In, "`in`")?;
         let collection = Box::new(self.expr(0)?);
-        if self.at(&T::Limit) {
-            let limit_start = self.current().span;
-            self.bump();
-            let mut limit_end = limit_start;
-            if matches!(self.current().kind, T::Integer(_)) {
-                limit_end = self.current().span;
-                self.bump();
-            }
-            let span = limit_start.join(limit_end);
-            self.diagnostics.push(
-                Diagnostic::error(
-                    "RL1020",
-                    Phase::Parse,
-                    span,
-                    "fold has no `limit`",
-                    "fold iterations are sequential by definition; `limit N` bounds                      only the concurrent `for` loop",
-                )
-                .with_fix(span, "", "remove `limit N` from the fold"),
-            );
-        }
         let body = self.loop_body()?;
         Some(Expr {
             span: start.join(body.span),
@@ -791,10 +776,10 @@ impl Parser {
             T::Return => "return".into(),
             T::For => "for".into(),
             T::In => "in".into(),
-            T::Limit => "limit".into(),
             T::Boundary => "boundary".into(),
             T::Fold => "fold".into(),
             T::Skip => "skip".into(),
+            T::Assert => "assert".into(),
             T::Fail => "fail".into(),
             T::Retry => "retry".into(),
             T::Catch => "catch".into(),
@@ -1006,10 +991,10 @@ fn is_field_token(t: &T) -> bool {
         T::Return
             | T::For
             | T::In
-            | T::Limit
             | T::Boundary
             | T::Fold
             | T::Skip
+            | T::Assert
             | T::Fail
             | T::Retry
             | T::Catch

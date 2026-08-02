@@ -1,6 +1,6 @@
-# A for expression returns an ordered list. The limit bounds active iterations.
+# A for expression returns an ordered list. The host bounds active iterations.
 numbers = [1, 2, 3, 4, 5, 6]
-squares = for number in numbers limit 3 {
+squares = for number in numbers {
     return number * number
 }
 
@@ -11,7 +11,7 @@ inventory = {
 }
 
 # Objects iterate as { key, value } records in sorted key order.
-stock_rows = for entry in inventory limit 2 {
+stock_rows = for entry in inventory {
     return {
         item: entry.key,
         count: entry.value,

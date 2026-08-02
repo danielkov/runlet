@@ -8,4 +8,4 @@ repository = "https://github.com/danielkov/runlet"
 
 [grammars.runlet]
 repository = "https://github.com/danielkov/runlet"
-rev = "ea324398fd595caa21758a17d3a4c6c3877c3cdd"
+rev = "05dd5e67d120a6dc4505a59fec968a99e3379a05"
