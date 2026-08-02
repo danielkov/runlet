@@ -9,8 +9,17 @@
         {
           "type": "REPEAT",
           "content": {
-            "type": "SYMBOL",
-            "name": "binding_statement"
+            "type": "CHOICE",
+            "members": [
+              {
+                "type": "SYMBOL",
+                "name": "binding_statement"
+              },
+              {
+                "type": "SYMBOL",
+                "name": "assert_statement"
+              }
+            ]
           }
         },
         {
@@ -100,6 +109,10 @@
               {
                 "type": "SYMBOL",
                 "name": "skip_statement"
+              },
+              {
+                "type": "SYMBOL",
+                "name": "assert_statement"
               }
             ]
           }
@@ -145,6 +158,68 @@
               "type": "BLANK"
             }
           ]
+        },
+        {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "STRING",
+              "value": ";"
+            },
+            {
+              "type": "BLANK"
+            }
+          ]
+        }
+      ]
+    },
+    "assert_statement": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "STRING",
+          "value": "assert"
+        },
+        {
+          "type": "STRING",
+          "value": "("
+        },
+        {
+          "type": "FIELD",
+          "name": "condition",
+          "content": {
+            "type": "SYMBOL",
+            "name": "_expression"
+          }
+        },
+        {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "SEQ",
+              "members": [
+                {
+                  "type": "STRING",
+                  "value": ","
+                },
+                {
+                  "type": "FIELD",
+                  "name": "message",
+                  "content": {
+                    "type": "SYMBOL",
+                    "name": "_expression"
+                  }
+                }
+              ]
+            },
+            {
+              "type": "BLANK"
+            }
+          ]
+        },
+        {
+          "type": "STRING",
+          "value": ")"
         },
         {
           "type": "CHOICE",
@@ -747,31 +822,6 @@
           }
         },
         {
-          "type": "CHOICE",
-          "members": [
-            {
-              "type": "SEQ",
-              "members": [
-                {
-                  "type": "STRING",
-                  "value": "limit"
-                },
-                {
-                  "type": "FIELD",
-                  "name": "limit",
-                  "content": {
-                    "type": "SYMBOL",
-                    "name": "integer"
-                  }
-                }
-              ]
-            },
-            {
-              "type": "BLANK"
-            }
-          ]
-        },
-        {
           "type": "FIELD",
           "name": "body",
           "content": {
@@ -1250,10 +1300,6 @@
         },
         {
           "type": "STRING",
-          "value": "limit"
-        },
-        {
-          "type": "STRING",
           "value": "boundary"
         },
         {
@@ -1279,6 +1325,10 @@
         {
           "type": "STRING",
           "value": "skip"
+        },
+        {
+          "type": "STRING",
+          "value": "assert"
         },
         {
           "type": "STRING",
