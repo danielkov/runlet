@@ -94,7 +94,10 @@ pub(crate) fn lex(source: &str) -> Result<Vec<Token>, Vec<Diagnostic>> {
         bracket: 0,
         frames: Vec::new(),
     };
-    while lx.pos < source.len() {
+    // Once tokenization fails, later token boundaries are not trustworthy.
+    // Return the first repair target instead of lexing string contents or
+    // other malformed text as unrelated Runlet tokens.
+    while lx.pos < source.len() && lx.diagnostics.is_empty() {
         lx.one();
     }
     lx.tokens.push(Token {

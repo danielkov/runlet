@@ -833,7 +833,9 @@ fn unknown_property_diagnostic_names_the_value_type() {
         .unwrap_or_else(|| panic!("expected RL2103, got {diagnostics:#?}"));
     assert!(
         diagnostic.message.contains("of type string[]")
-            && diagnostic.message.contains("iterate or index the list itself"),
+            && diagnostic
+                .message
+                .contains("iterate or index the list itself"),
         "message must name the type and the repair: {}",
         diagnostic.message
     );
@@ -916,15 +918,48 @@ return fold s = 0 for p in pairs { return s + p }
 fn parser_error_recovery_always_makes_progress() {
     // Regression: a parse error inside a block used as a call argument left
     // recovery stuck on the trailing `}`, looping forever and accumulating
-    // gigabytes of diagnostics. Recovery must terminate quickly with a
-    // bounded diagnostic list, and prefix `if` gets a targeted hint.
+    // gigabytes of diagnostics. Recovery must terminate and expose one
+    // targeted repair rather than its internal follow-on errors.
     let source = "x = list.flatten(for p in [1] { return if p then 1 else 2 })\nreturn x";
     let diagnostics = parse(source).unwrap_err();
-    assert!(
-        diagnostics.len() < 32,
-        "recovery must be bounded, got {} diagnostics",
-        diagnostics.len()
+    assert_eq!(
+        diagnostics.len(),
+        1,
+        "malformed syntax has one actionable diagnostic: {diagnostics:#?}"
     );
+}
+
+#[test]
+fn lexical_errors_stop_before_string_contents_become_diagnostics() {
+    // Distilled from a generated shell command. `\(` is not a JSON string
+    // escape and the following quote is syntactically the end of the Runlet
+    // string. Shell punctuation after it must not be reported as Runlet errors.
+    let source = r#"return shell({ command: "rg -n \"session::open|\bopen\(" src | head" })"#;
+    let diagnostics = parse(source).unwrap_err();
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostics[0].code, "RL1003", "{diagnostics:#?}");
+}
+
+#[test]
+fn valid_syntax_reports_independent_semantic_errors_together() {
+    let runtime = Runtime::builder().build().unwrap();
+    let diagnostics = runtime
+        .compile("a = missing_one\nb = missing_two\nreturn 1")
+        .expect_err("both names are unknown");
+    let unknown_names: Vec<_> = diagnostics.iter().filter(|d| d.code == "RL2101").collect();
+    assert_eq!(unknown_names.len(), 2, "{diagnostics:#?}");
+
+    let diagnostics = parse("return { a: 1, a: 2, b: 3, b: 4 }")
+        .expect_err("both duplicate properties are invalid");
+    let duplicates: Vec<_> = diagnostics.iter().filter(|d| d.code == "RL2203").collect();
+    assert_eq!(duplicates.len(), 2, "{diagnostics:#?}");
+}
+
+#[test]
+fn syntax_errors_take_priority_over_parser_level_semantic_errors() {
+    let diagnostics = parse("x = { a: 1, a: 2 }\nreturn )").unwrap_err();
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostics[0].phase, Phase::Parse, "{diagnostics:#?}");
 }
 
 #[test]
@@ -1489,8 +1524,9 @@ return result
     );
     assert_eq!(errors[0].code, "RL1014");
 
-    // Expression position with return-less branches (the JS habit): one
-    // fixable missing-return diagnostic per block, no cascade.
+    // Expression position with return-less branches (the JS habit): expose
+    // only the first fixable syntax diagnostic. A retry can then reveal the
+    // next malformed branch without presenting recovery artifacts.
     let source = "x = if 2 > 1 { 1 } else { 2 }\ny = 3\nreturn y";
     let diagnostics = runtime
         .compile(source)
@@ -1499,8 +1535,8 @@ return result
         .iter()
         .filter(|d| d.severity == Severity::Error)
         .collect();
-    assert_eq!(errors.len(), 2, "one diagnostic per block: {errors:#?}");
-    assert!(errors.iter().all(|d| d.code == "RL1017"), "{errors:#?}");
+    assert_eq!(errors.len(), 1, "one syntax repair at a time: {errors:#?}");
+    assert_eq!(errors[0].code, "RL1017", "{errors:#?}");
     assert!(
         errors.iter().all(|d| !d.fixes.is_empty()),
         "missing returns carry machine fixes: {errors:#?}"

@@ -4,7 +4,9 @@ use crate::syntax::*;
 
 /// Parses Runlet source into its syntax tree.
 ///
-/// Returns structured diagnostics when the source is not valid Runlet.
+/// Returns the first lexical or syntax diagnostic when the source is not valid
+/// Runlet. Parser-level semantic checks may report multiple independent errors
+/// once a complete, trustworthy syntax tree exists.
 pub fn parse(source: &str) -> Result<Program, Vec<Diagnostic>> {
     let tokens = lex(source)?;
     let mut p = Parser {
@@ -17,6 +19,15 @@ pub fn parse(source: &str) -> Result<Program, Vec<Diagnostic>> {
     let program = p.program();
     if p.diagnostics.is_empty() {
         program.ok_or_else(|| vec![p.expected("program")])
+    } else if let Some(index) = p
+        .diagnostics
+        .iter()
+        .position(|diagnostic| diagnostic.phase == Phase::Parse)
+    {
+        // Parser recovery is still used internally to select a targeted
+        // syntax diagnostic, but exposing later recovery errors encourages
+        // callers to act on artifacts of malformed syntax.
+        Err(vec![p.diagnostics.remove(index)])
     } else {
         Err(p.diagnostics)
     }

@@ -30,7 +30,8 @@ pub struct CompiledProgram {
 
 /// Parses and analyzes source against a tool registry and host inputs.
 ///
-/// Returns all fatal parse or analysis diagnostics when compilation fails.
+/// Returns the first fatal lexical or syntax diagnostic, or all independent
+/// analysis diagnostics, when compilation fails.
 pub fn compile(
     source: &str,
     registry: &ToolRegistry,
@@ -311,8 +312,14 @@ impl Analyzer<'_> {
                         message.push_str(" — iterate or index the list itself");
                     }
                     self.diagnostics.push(
-                        Diagnostic::error("RL2103", Phase::Analyze, e.span, "unknown property", message)
-                            .with_candidates(schema_fields(&t)),
+                        Diagnostic::error(
+                            "RL2103",
+                            Phase::Analyze,
+                            e.span,
+                            "unknown property",
+                            message,
+                        )
+                        .with_candidates(schema_fields(&t)),
                     );
                     Schema::Any
                 })
