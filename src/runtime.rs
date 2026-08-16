@@ -211,6 +211,8 @@ impl Runtime {
             depth: 0,
             dispatches: Arc::new(DispatchSemaphore::new(self.max_active_dispatches)),
             worker_budget: Arc::new(AtomicUsize::new(self.max_worker_threads)),
+            after_gates: vec![],
+            lexical_scope: 0,
         };
         let mut root = HashMap::new();
         for (n, (_, v)) in &self.inputs {
@@ -226,9 +228,7 @@ impl Runtime {
             .graph
             .begin(NodeKind::Root, "return", program.program.result.span, 0);
         ev.graph.running(node);
-        let outcome = ev
-            .guards_and_effects(&program.program.statements)
-            .and_then(|_| ev.eval(&program.program.result));
+        let outcome = ev.block_contents(&program.program.statements, &program.program.result);
         match outcome {
             Ok(v) => {
                 if let Some(producer) = ev.last_output {
@@ -407,7 +407,13 @@ enum Binding {
 /// key identifies the same binding in all of them. Without this, a binding
 /// referenced only inside a loop body is re-evaluated by every iteration —
 /// and chains of such loops re-evaluate exponentially.
-type BindingCache = Arc<Mutex<HashMap<(usize, String), (V, Option<usize>)>>>;
+#[derive(Clone)]
+enum CachedBinding {
+    Evaluating { waiters: usize },
+    Ready((V, Option<usize>)),
+    Failed { error: ToolError, waiters: usize },
+}
+type BindingCache = Arc<(Mutex<HashMap<(usize, String), CachedBinding>>, Condvar)>;
 
 struct Evaluator<'a> {
     runtime: &'a Runtime,
@@ -425,6 +431,10 @@ struct Evaluator<'a> {
     depth: usize,
     dispatches: Arc<DispatchSemaphore>,
     worker_budget: Arc<AtomicUsize>,
+    /// Completed `after` gates and the first lexical scope they govern.
+    after_gates: Vec<(usize, usize)>,
+    /// Scope containing the expression currently being evaluated.
+    lexical_scope: usize,
 }
 
 struct LiveGraph {
@@ -514,6 +524,17 @@ impl LiveGraph {
                 producer_path: producer_path.into(),
                 consumer_path: consumer_path.into(),
             },
+        };
+        state.graph.edges.push(edge.clone());
+        self.publish(&mut state, GraphChange::EdgeAdded(edge));
+    }
+
+    fn orders(&self, prerequisite: usize, dependent: usize) {
+        let mut state = self.state.lock().unwrap();
+        let edge = crate::Edge {
+            from: state.graph.nodes[prerequisite].id.clone(),
+            to: state.graph.nodes[dependent].id.clone(),
+            kind: crate::EdgeKind::Orders,
         };
         state.graph.edges.push(edge.clone());
         self.publish(&mut state, GraphChange::EdgeAdded(edge));
@@ -729,6 +750,7 @@ impl Evaluator<'_> {
                 let r = self.fail_error(arguments).and_then(Err);
                 self.finish(node, r)
             }
+            ExprKind::After { prerequisite, body } => self.after(e.span, prerequisite, body),
             ExprKind::Boundary {
                 retries,
                 body,
@@ -885,32 +907,118 @@ impl Evaluator<'_> {
                     .iter()
                     .find(|(base, _)| found < *base)
                     .map(|(_, cache)| cache.clone());
+                let key = (found, n.to_string());
                 if let Some(cache) = &cache {
-                    let cached = cache.lock().unwrap().get(&(found, n.to_string())).cloned();
-                    if let Some((v, producer)) = cached {
-                        self.last_output = producer;
-                        self.scopes[found].insert(n.into(), Binding::Value(v.clone(), producer));
-                        return Ok(v);
+                    let (values, ready) = &**cache;
+                    let mut values = values.lock().unwrap();
+                    let mut waiting = false;
+                    loop {
+                        match values.get(&key).cloned() {
+                            Some(CachedBinding::Ready((value, producer))) => {
+                                drop(values);
+                                self.last_output = producer;
+                                self.scopes[found]
+                                    .insert(n.into(), Binding::Value(value.clone(), producer));
+                                return Ok(value);
+                            }
+                            Some(CachedBinding::Evaluating { waiters }) => {
+                                if !waiting {
+                                    values.insert(
+                                        key.clone(),
+                                        CachedBinding::Evaluating {
+                                            waiters: waiters + 1,
+                                        },
+                                    );
+                                    waiting = true;
+                                }
+                                values = ready.wait(values).unwrap();
+                            }
+                            Some(CachedBinding::Failed { error, waiters }) if waiting => {
+                                if waiters == 1 {
+                                    values.remove(&key);
+                                    ready.notify_all();
+                                } else {
+                                    values.insert(
+                                        key.clone(),
+                                        CachedBinding::Failed {
+                                            error: error.clone(),
+                                            waiters: waiters - 1,
+                                        },
+                                    );
+                                }
+                                drop(values);
+                                self.scopes[found].insert(n.into(), Binding::Expr(e));
+                                return Err(error);
+                            }
+                            Some(CachedBinding::Failed { .. }) => {
+                                // Only callers already waiting on the failed
+                                // evaluation receive its error. A later caller
+                                // starts fresh once those errors are published.
+                                values = ready.wait(values).unwrap();
+                            }
+                            None => {
+                                values
+                                    .insert(key.clone(), CachedBinding::Evaluating { waiters: 0 });
+                                break;
+                            }
+                        }
                     }
                 }
                 self.scopes[found].insert(n.into(), Binding::Evaluating);
-                let r = self.eval(&e);
-                match &r {
-                    Ok(v) => {
+                let previous_scope = self.lexical_scope;
+                self.lexical_scope = found;
+                // A lazily forced binding retains the lexical ordering context
+                // of its declaration. Nested blocks in its expression may
+                // advance `lexical_scope`, so temporarily remove gates from
+                // after bodies nested more deeply than the binding itself.
+                let after_gates = std::mem::take(&mut self.after_gates);
+                self.after_gates = after_gates
+                    .iter()
+                    .copied()
+                    .filter(|&(_, first_scope)| first_scope <= found)
+                    .collect();
+                let result = self.eval(&e);
+                self.after_gates = after_gates;
+                self.lexical_scope = previous_scope;
+                match &result {
+                    Ok(value) => {
                         self.scopes[found]
-                            .insert(n.into(), Binding::Value(v.clone(), self.last_output));
-                        if let Some(cache) = &cache {
-                            cache
-                                .lock()
-                                .unwrap()
-                                .insert((found, n.to_string()), (v.clone(), self.last_output));
-                        }
+                            .insert(n.into(), Binding::Value(value.clone(), self.last_output));
                     }
                     Err(_) => {
                         self.scopes[found].insert(n.into(), Binding::Expr(e));
                     }
                 }
-                r
+                if let Some(cache) = &cache {
+                    let (values, ready) = &**cache;
+                    let mut values = values.lock().unwrap();
+                    let waiters = match values.get(&key) {
+                        Some(CachedBinding::Evaluating { waiters }) => *waiters,
+                        _ => 0,
+                    };
+                    match &result {
+                        Ok(value) => {
+                            values.insert(
+                                key,
+                                CachedBinding::Ready((value.clone(), self.last_output)),
+                            );
+                        }
+                        Err(error) if waiters > 0 => {
+                            values.insert(
+                                key,
+                                CachedBinding::Failed {
+                                    error: error.clone(),
+                                    waiters,
+                                },
+                            );
+                        }
+                        Err(_) => {
+                            values.remove(&key);
+                        }
+                    }
+                    ready.notify_all();
+                }
+                result
             }
         }
     }
@@ -922,6 +1030,11 @@ impl Evaluator<'_> {
             .get(&name)
             .ok_or_else(|| lang("RL2102", &format!("unknown tool `{name}`")))?;
         let node = self.blocked_node(NodeKind::Call, &name, span)?;
+        for &(gate, first_scope) in &self.after_gates {
+            if self.lexical_scope >= first_scope {
+                self.graph.orders(gate, node);
+            }
+        }
         let mut values = vec![];
         for (index, (a, expected)) in args.iter().zip(&desc.input.parameters).enumerate() {
             match self.eval(a).and_then(|v| self.convert(a.span, v, expected)) {
@@ -1112,8 +1225,10 @@ impl Evaluator<'_> {
         // Iterations share one cache of outer bindings they force, so a
         // binding referenced only inside the body evaluates once, not once
         // per iteration (see [`BindingCache`]).
-        self.binding_caches
-            .push((self.scopes.len(), Arc::new(Mutex::new(HashMap::new()))));
+        self.binding_caches.push((
+            self.scopes.len(),
+            Arc::new((Mutex::new(HashMap::new()), Condvar::new())),
+        ));
         let run_iteration = |mut child: Evaluator<'_>, i: usize, value: V| {
             let it = match child.node(
                 NodeKind::Iteration,
@@ -1212,6 +1327,20 @@ impl Evaluator<'_> {
         }
         self.finish(node, Ok(V::List(out)))
     }
+    fn after(&mut self, span: Span, prerequisite: &Expr, body: &Block) -> Result<V, ToolError> {
+        let prerequisite_value = self.eval(prerequisite)?;
+        let producer = self.last_output;
+        let gate = self.node(NodeKind::Compute, "after", span)?;
+        if let Some(producer) = producer {
+            self.graph.data(producer, gate, "output", "prerequisite");
+        }
+        self.graph.success(gate, prerequisite_value);
+        self.after_gates.push((gate, self.scopes.len()));
+        let result = self.block(body);
+        self.after_gates.pop();
+        result
+    }
+
     fn boundary(
         &mut self,
         span: Span,
@@ -1274,102 +1403,228 @@ impl Evaluator<'_> {
             }
         }
         self.scopes.push(scope);
-        let r = self
-            .guards_and_effects(&b.statements)
-            .and_then(|_| self.eval(&b.result));
+        let previous_scope = self.lexical_scope;
+        self.lexical_scope = self.scopes.len() - 1;
+        let result = self.block_contents(&b.statements, &b.result);
+        self.lexical_scope = previous_scope;
         self.scopes.pop();
-        r
+        result
     }
-    /// Runs a block's guards and implicit effect roots in statement order.
-    ///
-    /// `skip` statements evaluate immediately; a taken skip abandons the
-    /// current loop iteration via the internal `RL4107` signal. Statements
-    /// whose expressions contain effectful calls (or `fail`) are implicit
-    /// roots: they evaluate whether or not the block result references them,
-    /// so fire-and-forget writes are never silently dropped. Pure dead code
-    /// stays lazily pruned. A failing effect fails the block like any other
-    /// error.
-    fn guards_and_effects(&mut self, stmts: &[crate::Stmt]) -> Result<(), ToolError> {
-        for s in stmts {
-            match &s.kind {
-                crate::StmtKind::Skip { condition } => {
-                    let taken = match condition {
-                        None => true,
-                        Some(c) => match self.eval(c)? {
-                            V::Boolean(b) => b,
-                            other => {
-                                let mut e = lang(
-                                    "RL5202",
-                                    &format!(
-                                        "skip condition evaluated to {}; conditions must be \
-                                         true or false — Runlet has no truthiness, compare \
-                                         explicitly (e.g. `value != null`)",
-                                        value_kind(&other)
-                                    ),
-                                );
-                                e.span = Some(c.span);
-                                return Err(e);
-                            }
-                        },
-                    };
-                    if taken {
-                        let mut e = lang(SKIP_SIGNAL, "skip");
-                        e.span = Some(s.span);
-                        return Err(e);
-                    }
+    /// Evaluates statement guards in source order. Between guards, independent
+    /// implicit effect roots run concurrently; the final group also runs
+    /// concurrently with an independent block result. Data references collapse
+    /// dependent roots into one task, preserving their required ordering.
+    fn block_contents(&mut self, stmts: &[crate::Stmt], result: &Expr) -> Result<V, ToolError> {
+        // One single-flight cache spans every guard-delimited group in this
+        // block. Worker evaluators have cloned lexical scopes, so only this
+        // shared cache can publish an earlier root's value to a later guard or
+        // result without dispatching the binding again.
+        self.binding_caches.push((
+            self.scopes.len(),
+            Arc::new((Mutex::new(HashMap::new()), Condvar::new())),
+        ));
+        let outcome = (|| {
+            let mut group_start = 0;
+            for (index, statement) in stmts.iter().enumerate() {
+                if matches!(
+                    statement.kind,
+                    crate::StmtKind::Skip { .. } | crate::StmtKind::Assert { .. }
+                ) {
+                    self.concurrent_roots(&stmts[group_start..index], stmts, None)?;
+                    self.guard(statement)?;
+                    group_start = index + 1;
                 }
-                crate::StmtKind::Assert { condition, message } => {
-                    let node = self.node(NodeKind::Branch, "assert", s.span)?;
-                    let result = match self.eval(condition) {
-                        Ok(V::Boolean(true)) => Ok(V::Null),
-                        Ok(V::Boolean(false)) => {
-                            let message = match message {
-                                Some(message) => match self.eval(message)? {
-                                    V::String(message) => message,
-                                    other => {
-                                        let mut error = lang(
-                                            "RL5201",
-                                            &format!(
-                                                "assert message must be a string, got {}",
-                                                value_kind(&other)
-                                            ),
-                                        );
-                                        error.span = Some(message.span);
-                                        return Err(error);
-                                    }
-                                },
-                                None => "assertion failed".into(),
-                            };
-                            let mut error = ToolError::new("ASSERTION_FAILED", message);
-                            error.span = Some(s.span);
-                            Err(error)
-                        }
-                        Ok(other) => {
+            }
+            self.concurrent_roots(&stmts[group_start..], stmts, Some(result))?
+                .ok_or_else(|| lang("RL8104", "block result was not evaluated"))
+        })();
+        self.binding_caches.pop();
+        outcome
+    }
+
+    fn guard(&mut self, statement: &crate::Stmt) -> Result<(), ToolError> {
+        match &statement.kind {
+            crate::StmtKind::Skip { condition } => {
+                let taken = match condition {
+                    None => true,
+                    Some(condition) => match self.eval(condition)? {
+                        V::Boolean(value) => value,
+                        other => {
                             let mut error = lang(
                                 "RL5202",
                                 &format!(
-                                    "assert condition evaluated to {}; conditions must be \
-                                     true or false — Runlet has no truthiness, compare \
-                                     explicitly (e.g. `value != null`)",
+                                    "skip condition evaluated to {}; conditions must be true or false — Runlet has no truthiness, compare explicitly (e.g. `value != null`)",
                                     value_kind(&other)
                                 ),
                             );
                             error.span = Some(condition.span);
-                            Err(error)
+                            return Err(error);
                         }
-                        Err(error) => Err(error),
-                    };
-                    self.finish(node, result)?;
-                }
-                crate::StmtKind::Binding { name, value } => {
-                    if crate::analyzer::contains_effectful_call(value, &self.runtime.registry) {
-                        self.name(name)?;
-                    }
+                    },
+                };
+                if taken {
+                    let mut error = lang(SKIP_SIGNAL, "skip");
+                    error.span = Some(statement.span);
+                    Err(error)
+                } else {
+                    Ok(())
                 }
             }
+            crate::StmtKind::Assert { condition, message } => {
+                let node = self.node(NodeKind::Branch, "assert", statement.span)?;
+                let outcome = match self.eval(condition) {
+                    Ok(V::Boolean(true)) => Ok(V::Null),
+                    Ok(V::Boolean(false)) => {
+                        let message = match message {
+                            Some(message) => match self.eval(message)? {
+                                V::String(message) => message,
+                                other => {
+                                    let mut error = lang(
+                                        "RL5201",
+                                        &format!(
+                                            "assert message must be a string, got {}",
+                                            value_kind(&other)
+                                        ),
+                                    );
+                                    error.span = Some(message.span);
+                                    return Err(error);
+                                }
+                            },
+                            None => "assertion failed".into(),
+                        };
+                        let mut error = ToolError::new("ASSERTION_FAILED", message);
+                        error.span = Some(statement.span);
+                        Err(error)
+                    }
+                    Ok(other) => {
+                        let mut error = lang(
+                            "RL5202",
+                            &format!(
+                                "assert condition evaluated to {}; conditions must be true or false — Runlet has no truthiness, compare explicitly (e.g. `value != null`)",
+                                value_kind(&other)
+                            ),
+                        );
+                        error.span = Some(condition.span);
+                        Err(error)
+                    }
+                    Err(error) => Err(error),
+                };
+                self.finish(node, outcome).map(|_| ())
+            }
+            crate::StmtKind::Binding { .. } => Ok(()),
         }
-        Ok(())
     }
+
+    fn concurrent_roots(
+        &mut self,
+        group: &[crate::Stmt],
+        all_statements: &[crate::Stmt],
+        result: Option<&Expr>,
+    ) -> Result<Option<V>, ToolError> {
+        let candidates = group
+            .iter()
+            .filter_map(|statement| match &statement.kind {
+                crate::StmtKind::Binding { name, value }
+                    if crate::analyzer::contains_effectful_call(value, &self.runtime.registry) =>
+                {
+                    Some((name, statement.span, value))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let mut independent_after_inputs = std::collections::BTreeSet::new();
+        for (_, _, expression) in &candidates {
+            independent_after_inputs.extend(crate::analyzer::after_body_references(
+                expression,
+                all_statements,
+            ));
+        }
+        if let Some(expression) = result {
+            independent_after_inputs.extend(crate::analyzer::after_body_references(
+                expression,
+                all_statements,
+            ));
+        }
+        // Calls declared outside an after body remain sibling work even when
+        // pure. Only names on the body's unconditional demand path are started
+        // here; names in untaken branches stay lazy.
+        let mut tasks = all_statements
+            .iter()
+            .filter_map(|statement| match &statement.kind {
+                crate::StmtKind::Binding { name, .. }
+                    if independent_after_inputs.contains(name) =>
+                {
+                    Some(Expr {
+                        kind: ExprKind::Name(name.clone()),
+                        span: statement.span,
+                    })
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        // Every effectful candidate gets its own scheduling task. References
+        // from another candidate or from the result must not suppress it: that
+        // analysis is necessarily branch-blind. The binding cache provides
+        // single-flight deduplication when a taken dataflow also demands it.
+        tasks.extend(candidates.into_iter().map(|(name, span, _)| Expr {
+            kind: ExprKind::Name(name.clone()),
+            span,
+        }));
+        let result_index = result.map(|expression| {
+            let index = tasks.len();
+            tasks.push(expression.clone());
+            index
+        });
+        if tasks.is_empty() {
+            return Ok(None);
+        }
+
+        let tasks = Arc::new(tasks);
+        let next = Arc::new(AtomicUsize::new(0));
+        let outputs = Arc::new(Mutex::new(vec![None; tasks.len()]));
+        let desired_extra = tasks.len().saturating_sub(1);
+        let mut reserved = 0;
+        let _ =
+            self.worker_budget
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |available| {
+                    reserved = available.min(desired_extra);
+                    Some(available - reserved)
+                });
+        let templates = (0..reserved)
+            .map(|_| self.clone_for_branch())
+            .collect::<Vec<_>>();
+        let run = |mut evaluator: Evaluator<'_>| {
+            loop {
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                let Some(expression) = tasks.get(index) else {
+                    break;
+                };
+                let value = evaluator.eval(expression);
+                outputs.lock().unwrap()[index] = Some((value, evaluator.last_output));
+            }
+        };
+        std::thread::scope(|scope| {
+            for template in templates {
+                let run = &run;
+                scope.spawn(move || run(template));
+            }
+            run(self.clone_for_branch());
+        });
+        self.worker_budget.fetch_add(reserved, Ordering::Relaxed);
+
+        let mut outputs = outputs.lock().unwrap();
+        let mut returned = None;
+        for (index, output) in outputs.iter_mut().enumerate() {
+            let (value, producer) = output.take().expect("every root produced an output");
+            let value = value?;
+            if Some(index) == result_index {
+                self.last_output = producer;
+                returned = Some(value);
+            }
+        }
+        Ok(returned)
+    }
+
     fn budget(&self) -> Result<(), ToolError> {
         if self.graph.node_count() >= self.runtime.max_graph_nodes {
             return Err(lang(
@@ -1422,6 +1677,8 @@ impl Evaluator<'_> {
             depth: self.depth,
             dispatches: self.dispatches.clone(),
             worker_budget: self.worker_budget.clone(),
+            after_gates: self.after_gates.clone(),
+            lexical_scope: self.lexical_scope,
         }
     }
     fn finish(&mut self, node: usize, r: Result<V, ToolError>) -> Result<V, ToolError> {

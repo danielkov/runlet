@@ -116,7 +116,7 @@ impl Parser {
                 let sp = self.bump().span;
                 (s, sp)
             }
-            T::If | T::For | T::Fold | T::Boundary => {
+            T::If | T::For | T::Fold | T::After | T::Boundary => {
                 let keyword = self.current().kind.clone();
                 let guidance = match keyword {
                     T::If => {
@@ -408,6 +408,7 @@ impl Parser {
             T::LBrace => self.object(tok.span)?,
             T::For => self.for_expr(tok.span)?,
             T::Fold => self.fold_expr(tok.span)?,
+            T::After => self.after_expr(tok.span)?,
             T::Fail => self.fail_expr(tok.span)?,
             T::Boundary => self.boundary(tok.span)?,
             T::If => self.if_expr(tok.span)?,
@@ -709,6 +710,14 @@ impl Parser {
         self.skip_allowed = saved;
         body
     }
+    fn after_expr(&mut self, start: Span) -> Option<Expr> {
+        let prerequisite = Box::new(self.expr(0)?);
+        let body = self.block()?;
+        Some(Expr {
+            span: start.join(body.span),
+            kind: ExprKind::After { prerequisite, body },
+        })
+    }
     fn boundary(&mut self, start: Span) -> Option<Expr> {
         let retries = if self.take(&T::Retry) {
             match self.bump().kind.clone() {
@@ -787,6 +796,7 @@ impl Parser {
             T::Return => "return".into(),
             T::For => "for".into(),
             T::In => "in".into(),
+            T::After => "after".into(),
             T::Boundary => "boundary".into(),
             T::Fold => "fold".into(),
             T::Skip => "skip".into(),
@@ -1002,6 +1012,7 @@ fn is_field_token(t: &T) -> bool {
         T::Return
             | T::For
             | T::In
+            | T::After
             | T::Boundary
             | T::Fold
             | T::Skip

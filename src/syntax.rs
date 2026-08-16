@@ -210,6 +210,15 @@ pub enum ExprKind {
         /// Code, message, and optional details expressions.
         arguments: Vec<Expr>,
     },
+    /// `after prerequisite { ... return value }` — evaluates the prerequisite
+    /// to completion before entering the block. The prerequisite's value is
+    /// discarded; bindings from the surrounding scope remain visible.
+    After {
+        /// Expression that must complete before the body starts.
+        prerequisite: Box<Expr>,
+        /// Block evaluated after the prerequisite succeeds.
+        body: Block,
+    },
     /// Retryable subgraph with a catch fallback.
     Boundary {
         /// Maximum number of retries after the initial attempt.

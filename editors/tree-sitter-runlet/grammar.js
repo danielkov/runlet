@@ -61,6 +61,7 @@ module.exports = grammar({
         $.for_expression,
         $.fold_expression,
         $.fail_expression,
+        $.after_expression,
         $.boundary_expression,
         $._primary_expression,
       ),
@@ -166,6 +167,9 @@ module.exports = grammar({
         ")",
       ),
 
+    after_expression: ($) =>
+      seq("after", field("prerequisite", $._expression), field("body", $.block)),
+
     boundary_expression: ($) =>
       seq(
         "boundary",
@@ -217,7 +221,7 @@ module.exports = grammar({
     field_name: ($) =>
       choice(
         $.identifier,
-        "return", "for", "in", "boundary", "retry", "catch", "if", "else",
+        "return", "for", "in", "after", "boundary", "retry", "catch", "if", "else",
         "fold", "skip", "assert", "fail", "and", "or", "not", "null", "true", "false",
       ),
     identifier: (_) => /[_\p{L}][_\p{L}\p{M}\p{N}]*/,

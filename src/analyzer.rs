@@ -618,6 +618,22 @@ impl Analyzer<'_> {
                 }
                 Schema::Never
             }
+            ExprKind::After { prerequisite, body } => {
+                self.expr(prerequisite);
+                self.scopes.push(BTreeMap::new());
+                let result = self.block_bindings(&body.statements, &body.result, false);
+                self.scopes.pop();
+                if !block_contains(body, contains_call) {
+                    self.diagnostics.push(Diagnostic::warning(
+                        "RL1207",
+                        Phase::Analyze,
+                        e.span,
+                        "after block creates no calls",
+                        "`after` orders only calls lexically created in its block; this block creates none",
+                    ));
+                }
+                result
+            }
             ExprKind::Boundary {
                 body,
                 error_binding,
@@ -779,6 +795,10 @@ pub(crate) fn contains_effectful_call(e: &Expr, registry: &ToolRegistry) -> bool
             contains_effectful_call(collection, registry)
                 || block_contains(body, |e| contains_effectful_call(e, registry))
         }
+        ExprKind::After { prerequisite, body } => {
+            contains_effectful_call(prerequisite, registry)
+                || block_contains(body, |e| contains_effectful_call(e, registry))
+        }
         ExprKind::Boundary { body, catch, .. } => [body, catch]
             .into_iter()
             .any(|b| block_contains(b, |e| contains_effectful_call(e, registry))),
@@ -803,7 +823,7 @@ fn block_contains(b: &crate::Block, pred: impl Fn(&Expr) -> bool + Copy) -> bool
         }
     }) || pred(&b.result)
 }
-fn contains_call(e: &Expr) -> bool {
+pub(crate) fn contains_call(e: &Expr) -> bool {
     match &e.kind {
         ExprKind::Call { .. } => true,
         ExprKind::List(x) => x.iter().any(contains_call),
@@ -843,6 +863,9 @@ fn contains_call(e: &Expr) -> bool {
         | ExprKind::Fold {
             collection, body, ..
         } => contains_call(collection) || block_contains(body, contains_call),
+        ExprKind::After { prerequisite, body } => {
+            contains_call(prerequisite) || block_contains(body, contains_call)
+        }
         ExprKind::Boundary { body, catch, .. } => [body, catch]
             .into_iter()
             .any(|b| block_contains(b, contains_call)),
@@ -913,6 +936,10 @@ fn collect_names(e: &Expr, defs: &BTreeMap<String, &Expr>, used: &mut BTreeSet<S
             if let Some(block) = else_block {
                 collect_block_names(block, defs, used);
             }
+        }
+        ExprKind::After { prerequisite, body } => {
+            collect_names(prerequisite, defs, used);
+            collect_block_names(body, defs, used)
         }
         ExprKind::Boundary { body, catch, .. } => {
             collect_block_names(body, defs, used);
@@ -1460,4 +1487,124 @@ fn lev(a: &str, b: &str) -> usize {
         }
     }
     *d.last().unwrap()
+}
+
+/// Outer names that can be scheduled independently before entering a block.
+/// Lazy branch arms, loop bodies, catch blocks, and assertion messages are excluded.
+pub(crate) fn free_names_in_block(block: &crate::Block) -> BTreeSet<String> {
+    fn expression(e: &Expr, bound: &BTreeSet<String>, free: &mut BTreeSet<String>) {
+        match &e.kind {
+            ExprKind::Name(name) => {
+                if !bound.contains(name) {
+                    free.insert(name.clone());
+                }
+            }
+            ExprKind::List(values) => values.iter().for_each(|e| expression(e, bound, free)),
+            ExprKind::Object(values) => values.iter().for_each(|(key, value)| {
+                if let Some(key) = key.expr() {
+                    expression(key, bound, free);
+                }
+                expression(value, bound, free);
+            }),
+            ExprKind::Member { target, .. } | ExprKind::Unary { value: target, .. } => {
+                expression(target, bound, free)
+            }
+            ExprKind::Index { target, index } => {
+                expression(target, bound, free);
+                expression(index, bound, free);
+            }
+            ExprKind::Binary { left, op, right } => {
+                expression(left, bound, free);
+                if !matches!(op, crate::BinaryOp::And | crate::BinaryOp::Or) {
+                    expression(right, bound, free);
+                }
+            }
+            ExprKind::Call { arguments, .. } | ExprKind::Fail { arguments } => {
+                arguments.iter().for_each(|e| expression(e, bound, free))
+            }
+            // Branch arms remain lazy. Only the condition is guaranteed to be
+            // demanded before the selected arm is known.
+            ExprKind::Conditional { condition, .. } | ExprKind::If { condition, .. } => {
+                expression(condition, bound, free);
+            }
+            // A loop body may execute zero times, so only its collection (and
+            // a fold's initializer) can be scheduled ahead unconditionally.
+            ExprKind::For { collection, .. } => expression(collection, bound, free),
+            ExprKind::Fold {
+                init, collection, ..
+            } => {
+                expression(init, bound, free);
+                expression(collection, bound, free);
+            }
+            ExprKind::After { prerequisite, body } => {
+                expression(prerequisite, bound, free);
+                block_names(body, bound, free);
+            }
+            ExprKind::Boundary { body, .. } => {
+                // The catch block is demanded only after a body failure.
+                block_names(body, bound, free);
+            }
+            ExprKind::Null
+            | ExprKind::Boolean(_)
+            | ExprKind::Integer(_)
+            | ExprKind::Number(_)
+            | ExprKind::String(_) => {}
+        }
+    }
+    fn block_names(block: &crate::Block, outer: &BTreeSet<String>, free: &mut BTreeSet<String>) {
+        let mut bound = outer.clone();
+        for statement in &block.statements {
+            if let crate::StmtKind::Binding { name, .. } = &statement.kind {
+                bound.insert(name.clone());
+            }
+        }
+        for statement in &block.statements {
+            match &statement.kind {
+                crate::StmtKind::Binding { value, .. } if contains_call(value) => {
+                    expression(value, &bound, free);
+                }
+                crate::StmtKind::Binding { .. } => {}
+                crate::StmtKind::Skip { condition } => {
+                    if let Some(condition) = condition {
+                        expression(condition, &bound, free);
+                    }
+                }
+                crate::StmtKind::Assert { condition, .. } => {
+                    expression(condition, &bound, free);
+                }
+            }
+        }
+        expression(&block.result, &bound, free);
+    }
+    let mut free = BTreeSet::new();
+    block_names(block, &BTreeSet::new(), &mut free);
+    free
+}
+
+/// Outer names referenced from an `after` body do not order the containing
+/// expression: they remain independently schedulable roots. Follows local
+/// aliases so the common `ordered = after ...; return ordered` shape works.
+pub(crate) fn after_body_references(
+    expression: &Expr,
+    statements: &[crate::Stmt],
+) -> BTreeSet<String> {
+    let defs = statements
+        .iter()
+        .filter_map(|statement| statement.binding())
+        .map(|(name, value)| (name.clone(), value))
+        .collect::<BTreeMap<_, _>>();
+    fn visit(
+        expression: &Expr,
+        defs: &BTreeMap<String, &Expr>,
+        seen: &mut BTreeSet<String>,
+    ) -> BTreeSet<String> {
+        match &expression.kind {
+            ExprKind::Name(name) if seen.insert(name.clone()) => defs
+                .get(name)
+                .map_or_else(BTreeSet::new, |expression| visit(expression, defs, seen)),
+            ExprKind::After { body, .. } => free_names_in_block(body),
+            _ => BTreeSet::new(),
+        }
+    }
+    visit(expression, &defs, &mut BTreeSet::new())
 }

@@ -10,6 +10,7 @@
   "return"
   "for"
   "in"
+  "after"
   "boundary"
   "retry"
   "catch"

@@ -45,9 +45,9 @@ The language has no imports, packages, user-defined classes, macros, threads, ex
 
 ### 2.1 Lexical rules
 
-Source is UTF-8. Identifiers use Unicode XID start/continue rules; tool authors SHOULD expose simple ASCII identifiers. The reserved words are `return`, `for`, `in`, `boundary`, `fold`, `skip`, `assert`, `fail`, `retry`, `catch`, `if`, `else`, `and`, `or`, `not`, `null`, `true`, and `false`. They cannot be binding names or registry roots. A reserved word is permitted contextually as an object property name or after `.`, so `{ assert: true }` and `result.assert` remain natural; quoted/indexed spellings are also valid.
+Source is UTF-8. Identifiers use Unicode XID start/continue rules; tool authors SHOULD expose simple ASCII identifiers. The reserved words are `return`, `for`, `in`, `after`, `boundary`, `fold`, `skip`, `assert`, `fail`, `retry`, `catch`, `if`, `else`, `and`, `or`, `not`, `null`, `true`, and `false`. They cannot be binding names or registry roots. A reserved word is permitted contextually as an object property name or after `.`, so `{ assert: true }` and `result.assert` remain natural; quoted/indexed spellings are also valid.
 
-Indentation is not significant. A newline terminates a simple statement unless it occurs inside an open `()`, `[]`, or expression-object `{}`, or the preceding token is one of this exhaustive continuation set: `=`, `,`, `:`, `+`, `-`, `*`, `/`, `%`, `==`, `!=`, `<`, `<=`, `>`, `>=`, `and`, `or`, `not`, `in`, `if`, or `else`. Compound `for`, `boundary`, and `catch` headers must place their opening `{` on the header line; a boundary body's closing `}` and its `catch` must likewise be on one line as `} catch err {`. A newline immediately followed by `(` or `[` never continues the preceding expression; a call/index continuation must remain on the same line or wrap the whole expression in open parentheses. Semicolons may terminate simple statements and are optional immediately before `}`. Comments start with `#` or `//` and continue to end of line. Block comments are deliberately omitted.
+Indentation is not significant. A newline terminates a simple statement unless it occurs inside an open `()`, `[]`, or expression-object `{}`, or the preceding token is one of this exhaustive continuation set: `=`, `,`, `:`, `+`, `-`, `*`, `/`, `%`, `==`, `!=`, `<`, `<=`, `>`, `>=`, `and`, `or`, `not`, `in`, `if`, or `else`. Compound `for`, `after`, `boundary`, and `catch` headers must place their opening `{` on the header line; a boundary body's closing `}` and its `catch` must likewise be on one line as `} catch err {`. A newline immediately followed by `(` or `[` never continues the preceding expression; a call/index continuation must remain on the same line or wrap the whole expression in open parentheses. Semicolons may terminate simple statements and are optional immediately before `}`. Comments start with `#` or `//` and continue to end of line. Block comments are deliberately omitted.
 
 Literals are:
 
@@ -77,6 +77,7 @@ for_expr      = "for" , IDENT , "in" , expression , block_return ;
 fold_expr     = "fold" , IDENT , "=" , expression ,
                 "for" , IDENT , "in" , expression , block_return ;
 fail_expr     = "fail" , "(" , arguments , ")" ;
+after_expr    = "after" , expression , block_return ;
 
 boundary_expr = "boundary" , retry_clause? , block_return , catch_clause_return ;
 retry_clause  = "retry" , INTEGER ;
@@ -98,7 +99,7 @@ index         = "[" , expression , "]" ;
 call          = "(" , arguments? , ")" ;
 arguments     = expression , ( "," , expression )* , ","? ;
 primary       = literal | IDENT | list | object | "(" , expression , ")"
-              | if_expr | for_expr | fold_expr | fail_expr | boundary_expr ;
+              | if_expr | for_expr | fold_expr | fail_expr | after_expr | boundary_expr ;
 literal       = "null" | "true" | "false" | INTEGER | NUMBER | STRING ;
 list          = "[" , ( expression , ( "," , expression )* , ","? )? , "]" ;
 object        = "{" , ( object_item , ( "," , object_item )* , ","? )? , "}" ;
@@ -187,9 +188,11 @@ Dot projection is equivalent to indexing by that literal field name after schema
 
 ### 2.5 Reachability and execution
 
-Runlet is lazy with respect to pure work and eager with respect to declared effects. Pure tool and compute nodes are eligible to run only when transitively reachable from the program's returned value. Statements whose expressions contain a call to a tool with an effectful execution policy (anything other than `Pure`) are *implicit roots*: when their enclosing block runs, they evaluate in statement order before the block result, whether or not the result references them. This keeps `return waits only for values it references` precise for reads and transforms while guaranteeing that a fire-and-forget write the author bound is never silently dropped.
+Runlet is lazy with respect to pure work and eager with respect to declared effects. Pure tool and compute nodes are eligible to run only when transitively reachable from the program's returned value. Statements whose expressions contain a call to a tool with an effectful execution policy (anything other than `Pure`) are *implicit roots*: when their enclosing block runs, independent roots evaluate concurrently with each other and with an independent block result, whether or not the result references them. The return expression pulls in only the reads and transforms it references, while block completion also joins every implicit effect root; a fire-and-forget write is never silently dropped.
 
 At initial planning, the runtime creates nodes and edges for all statically discoverable expressions. It then performs reachability from the root return node plus every effect-rooted statement of the executed block. Dynamic branch/loop expansion adds reachable nodes later; an effect binding inside a loop body roots once per iteration, and a postfix conditional around an effectful call still selects which branch dispatches. A failing effect root fails its block exactly like a referenced call, so `boundary` owns it.
+
+`after prerequisite { ... return value }` adds an explicit lexical ordering gate: the prerequisite must succeed before calls declared inside the block may start, its value is discarded, and the block result is the expression result. The gate is inherited by calls in selected nested branches and dynamic loop iterations and is represented by `Orders` edges from the completed gate node to those calls. Lists and objects naturally join multiple prerequisite expressions. Surrounding bindings remain visible, but a call declared outside the block does not move behind the gate merely because the body references it; it remains independently schedulable and its value is joined without redispatch. A prerequisite failure prevents the block from materializing and propagates normally to an enclosing boundary. `RL1207` warns when an `after` block lexically creates no calls, because the ordering gate is then usually a no-op.
 
 After reachability analysis, an unused binding whose expression contains an effectful call receives no diagnostic — it runs. An unused binding containing only pure calls, literals, or deterministic local compute is pruned and receives warning `RL1205 UNUSED_BINDING`. Thus a pure `x = tool()` never silently dispatches, an effectful one never silently disappears, and both outcomes are visible: the first in diagnostics, the second in the execution graph. (Fatal `RL1204 UNREACHABLE_EFFECT` from earlier drafts is retired; the code is reserved.)
 
@@ -264,8 +267,9 @@ would be incoherent; the parser rejects it with `RL1018`). A taken skip ends
 the current iteration: in `for`, the element is dropped from the loop result
 (filtering); in `fold`, the accumulator passes through unchanged. Skip
 conditions follow the same no-truthiness rule as all conditions and always
-evaluate, in statement order interleaved with implicit effect roots, before
-the block result. Making skips explicit (rather than treating a block that
+evaluate in statement order before the block result. A guard divides sibling
+effect roots into ordered groups; independent roots between guards remain
+concurrent. Making skips explicit (rather than treating a block that
 falls off the end as "yields nothing") preserves totality checking: a body
 path that neither returns nor skips is still a compile error, so a forgotten
 `return` cannot silently shorten a result list.

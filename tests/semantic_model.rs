@@ -127,10 +127,10 @@ fn effect_descriptor(name: &str, input: Vec<Schema>, output: Schema) -> ToolDesc
 }
 
 #[test]
-fn unused_effectful_calls_execute_as_implicit_roots_in_order() {
+fn unused_effectful_calls_execute_as_concurrent_implicit_roots() {
     // A statement containing an effectful call is an implicit root: it runs
-    // when its block runs, in statement order, whether or not the return
-    // references it. Fire-and-forget writes are never silently dropped.
+    // when its block runs, independently of source order, whether or not the
+    // return references it. Fire-and-forget writes are never silently dropped.
     let mut registry = ToolRegistry::new();
     registry
         .register(effect_descriptor("audit.first", vec![], Schema::Boolean))
@@ -162,7 +162,9 @@ fn unused_effectful_calls_execute_as_implicit_roots_in_order() {
     );
     let execution = runtime.run(&program).unwrap();
     assert_eq!(execution.value, CanonicalValue::Boolean(true));
-    assert_eq!(*log.lock().unwrap(), vec!["first", "second"]);
+    let mut entries = log.lock().unwrap().clone();
+    entries.sort();
+    assert_eq!(entries, vec!["first", "second"]);
 }
 
 #[test]
@@ -1666,4 +1668,531 @@ fn runtime_errors_inside_loop_iterations_keep_their_spans() {
     assert_eq!(error.code, "RL5203");
     let span = error.span.expect("loop-iteration errors carry spans");
     assert_eq!(&source[span.start..span.end], "x[0]");
+}
+
+#[test]
+fn independent_implicit_effect_roots_overlap() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(effect_descriptor("audit.left", vec![], Schema::Boolean))
+        .unwrap();
+    registry
+        .register(effect_descriptor("audit.right", vec![], Schema::Boolean))
+        .unwrap();
+    let active = Arc::new(AtomicUsize::new(0));
+    let maximum = Arc::new(AtomicUsize::new(0));
+    let handler = |active: &Arc<AtomicUsize>, maximum: &Arc<AtomicUsize>| {
+        let active = active.clone();
+        let maximum = maximum.clone();
+        move |_: &[CanonicalValue], _: &ToolContext| {
+            let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+            maximum.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            active.fetch_sub(1, Ordering::SeqCst);
+            Ok(CanonicalValue::Boolean(true))
+        }
+    };
+    let runtime = Runtime::builder()
+        .registry(registry)
+        .tool("audit.left", handler(&active, &maximum))
+        .tool("audit.right", handler(&active, &maximum))
+        .build()
+        .unwrap();
+    let program = runtime
+        .compile("left = audit.left()\nright = audit.right()\nreturn true")
+        .unwrap();
+    assert_eq!(
+        runtime.run(&program).unwrap().value,
+        CanonicalValue::Boolean(true)
+    );
+    assert_eq!(maximum.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn after_orders_a_block_behind_its_prerequisite() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(effect_descriptor("audit.first", vec![], Schema::Boolean))
+        .unwrap();
+    registry
+        .register(effect_descriptor("audit.second", vec![], Schema::INTEGER))
+        .unwrap();
+    let stage = Arc::new(AtomicUsize::new(0));
+    let runtime = Runtime::builder()
+        .registry(registry)
+        .tool("audit.first", {
+            let stage = stage.clone();
+            move |_, _| {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                stage.store(1, Ordering::SeqCst);
+                Ok(CanonicalValue::Boolean(true))
+            }
+        })
+        .tool("audit.second", {
+            let stage = stage.clone();
+            move |_, _| {
+                assert_eq!(stage.load(Ordering::SeqCst), 1);
+                Ok(CanonicalValue::Integer(42))
+            }
+        })
+        .build()
+        .unwrap();
+    let source = "first = audit.first()\nsecond = after first {\n  observed = audit.second()\n  return observed\n}\nreturn second";
+    let program = runtime.compile(source).unwrap();
+    assert!(program.diagnostics.is_empty(), "{:?}", program.diagnostics);
+    assert_eq!(
+        runtime.run(&program).unwrap().value,
+        CanonicalValue::Integer(42)
+    );
+}
+
+#[test]
+fn after_parser_preserves_prerequisite_and_block_ast() {
+    let program =
+        parse("ordered = after [first, second] {\n  local = 7\n  return local\n}\nreturn ordered")
+            .unwrap();
+    let StmtKind::Binding { value, .. } = &program.statements[0].kind else {
+        panic!()
+    };
+    let ExprKind::After { prerequisite, body } = &value.kind else {
+        panic!()
+    };
+    assert!(matches!(prerequisite.kind, ExprKind::List(ref values) if values.len() == 2));
+    assert_eq!(body.statements.len(), 1);
+    assert!(matches!(body.result.kind, ExprKind::Name(ref name) if name == "local"));
+}
+
+#[test]
+fn analyzer_warns_when_after_has_no_lexically_created_calls() {
+    let runtime = Runtime::builder().build().unwrap();
+    let program = runtime
+        .compile("ordered = after true { return 7 }\nreturn ordered")
+        .unwrap();
+    assert!(
+        program
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "RL1207"
+                && diagnostic.severity == Severity::Warning)
+    );
+}
+
+#[test]
+fn after_accepts_multiple_prerequisites_in_objects_and_lists() {
+    let mut registry = ToolRegistry::new();
+    for name in ["step.one", "step.two", "step.body"] {
+        registry
+            .register(effect_descriptor(name, vec![], Schema::INTEGER))
+            .unwrap();
+    }
+    let bits = Arc::new(AtomicUsize::new(0));
+    let runtime = Runtime::builder()
+        .registry(registry)
+        .tool("step.one", {
+            let bits = bits.clone();
+            move |_, _| {
+                bits.fetch_or(1, Ordering::SeqCst);
+                Ok(1.into())
+            }
+        })
+        .tool("step.two", {
+            let bits = bits.clone();
+            move |_, _| {
+                bits.fetch_or(2, Ordering::SeqCst);
+                Ok(2.into())
+            }
+        })
+        .tool("step.body", {
+            let bits = bits.clone();
+            move |_, _| {
+                assert_eq!(bits.load(Ordering::SeqCst), 3);
+                Ok(3.into())
+            }
+        })
+        .build()
+        .unwrap();
+    let source = "ordered = after { list: [step.one()], other: step.two() } { return step.body() }\nreturn ordered";
+    assert_eq!(
+        runtime
+            .run(&runtime.compile(source).unwrap())
+            .unwrap()
+            .value,
+        CanonicalValue::Integer(3)
+    );
+}
+
+#[test]
+fn failed_after_prerequisite_never_enters_the_body_and_is_catchable() {
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(effect_descriptor("step.fail", vec![], Schema::Boolean))
+        .unwrap();
+    registry
+        .register(effect_descriptor("step.body", vec![], Schema::Boolean))
+        .unwrap();
+    let body_calls = Arc::new(AtomicUsize::new(0));
+    let runtime = Runtime::builder()
+        .registry(registry)
+        .tool("step.fail", |_, _| {
+            Err(ToolError::new("STOP", "prerequisite failed"))
+        })
+        .tool("step.body", {
+            let body_calls = body_calls.clone();
+            move |_, _| {
+                body_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(true.into())
+            }
+        })
+        .build()
+        .unwrap();
+    let source = "outcome = boundary { return after step.fail() { return step.body() } } catch err { return err.code }\nreturn outcome";
+    assert_eq!(
+        runtime
+            .run(&runtime.compile(source).unwrap())
+            .unwrap()
+            .value,
+        CanonicalValue::String("STOP".into())
+    );
+    assert_eq!(body_calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn after_gate_is_inherited_by_nested_branches_and_loops() {
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(effect_descriptor("step.ready", vec![], Schema::Boolean))
+        .unwrap();
+    registry
+        .register(effect_descriptor(
+            "step.item",
+            vec![Schema::INTEGER],
+            Schema::INTEGER,
+        ))
+        .unwrap();
+    let ready = Arc::new(AtomicUsize::new(0));
+    let runtime = Runtime::builder()
+        .registry(registry)
+        .tool("step.ready", {
+            let ready = ready.clone();
+            move |_, _| {
+                ready.store(1, Ordering::SeqCst);
+                Ok(true.into())
+            }
+        })
+        .tool("step.item", {
+            let ready = ready.clone();
+            move |args, _| {
+                assert_eq!(ready.load(Ordering::SeqCst), 1);
+                Ok(args[0].clone())
+            }
+        })
+        .build()
+        .unwrap();
+    let source = "values = after step.ready() { return if true { return for item in [1, 2] { return step.item(item) } } else { return [] } }\nreturn values";
+    let execution = runtime.run(&runtime.compile(source).unwrap()).unwrap();
+    assert_eq!(
+        execution.value,
+        CanonicalValue::List(vec![1.into(), 2.into()])
+    );
+    let gate = execution
+        .graph
+        .nodes
+        .iter()
+        .find(|node| node.label == "after")
+        .unwrap();
+    let calls = execution
+        .graph
+        .nodes
+        .iter()
+        .filter(|node| node.label == "step.item")
+        .collect::<Vec<_>>();
+    assert_eq!(calls.len(), 2);
+    for call in calls {
+        assert!(execution.graph.edges.iter().any(|edge| edge.from == gate.id
+            && edge.to == call.id
+            && edge.kind == EdgeKind::Orders));
+    }
+}
+
+#[test]
+fn after_does_not_retroactively_gate_or_duplicate_an_external_call() {
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(descriptor("step.external", vec![], Schema::INTEGER))
+        .unwrap();
+    registry
+        .register(effect_descriptor("step.slow", vec![], Schema::Boolean))
+        .unwrap();
+    registry
+        .register(effect_descriptor(
+            "step.body",
+            vec![Schema::INTEGER],
+            Schema::INTEGER,
+        ))
+        .unwrap();
+    let external_started = Arc::new(AtomicUsize::new(0));
+    let external_calls = Arc::new(AtomicUsize::new(0));
+    let runtime = Runtime::builder()
+        .registry(registry)
+        .tool("step.external", {
+            let started = external_started.clone();
+            let calls = external_calls.clone();
+            move |_, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                started.store(1, Ordering::SeqCst);
+                Ok(9.into())
+            }
+        })
+        .tool("step.slow", {
+            let started = external_started.clone();
+            move |_, _| {
+                std::thread::sleep(Duration::from_millis(30));
+                assert_eq!(
+                    started.load(Ordering::SeqCst),
+                    1,
+                    "external root was delayed behind prerequisite"
+                );
+                Ok(true.into())
+            }
+        })
+        .tool("step.body", |args, _| Ok(args[0].clone()))
+        .build()
+        .unwrap();
+    let source = "external = step.external()\nordered = after step.slow() { return step.body(external) }\nreturn ordered";
+    let execution = runtime.run(&runtime.compile(source).unwrap()).unwrap();
+    assert_eq!(execution.value, CanonicalValue::Integer(9));
+    assert_eq!(external_calls.load(Ordering::SeqCst), 1);
+    let gate = execution
+        .graph
+        .nodes
+        .iter()
+        .find(|node| node.label == "after")
+        .unwrap();
+    let external = execution
+        .graph
+        .nodes
+        .iter()
+        .find(|node| node.label == "step.external")
+        .unwrap();
+    let body = execution
+        .graph
+        .nodes
+        .iter()
+        .find(|node| node.label == "step.body")
+        .unwrap();
+    assert!(
+        !execution.graph.edges.iter().any(|edge| edge.from == gate.id
+            && edge.to == external.id
+            && edge.kind == EdgeKind::Orders)
+    );
+    assert!(
+        execution.graph.edges.iter().any(|edge| edge.from == gate.id
+            && edge.to == body.id
+            && edge.kind == EdgeKind::Orders)
+    );
+}
+
+#[test]
+fn after_does_not_gate_a_conditionally_forced_outer_binding_with_a_nested_block() {
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(descriptor("step.external_nested", vec![], Schema::INTEGER))
+        .unwrap();
+    registry
+        .register(effect_descriptor(
+            "step.ready_nested",
+            vec![],
+            Schema::Boolean,
+        ))
+        .unwrap();
+    registry
+        .register(effect_descriptor(
+            "step.body_nested",
+            vec![Schema::INTEGER],
+            Schema::INTEGER,
+        ))
+        .unwrap();
+    let external_calls = Arc::new(AtomicUsize::new(0));
+    let runtime = Runtime::builder()
+        .registry(registry)
+        .tool("step.external_nested", {
+            let calls = external_calls.clone();
+            move |_, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(9.into())
+            }
+        })
+        .tool("step.ready_nested", |_, _| Ok(true.into()))
+        .tool("step.body_nested", |args, _| Ok(args[0].clone()))
+        .build()
+        .unwrap();
+    let source = "external = if true { return step.external_nested() } else { return 0 }
+ordered = after step.ready_nested() { return if true { return step.body_nested(external) } else { return 0 } }
+return ordered";
+    let execution = runtime.run(&runtime.compile(source).unwrap()).unwrap();
+    assert_eq!(execution.value, CanonicalValue::Integer(9));
+    assert_eq!(external_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        execution
+            .graph
+            .nodes
+            .iter()
+            .filter(|node| node.label == "step.external_nested")
+            .count(),
+        1
+    );
+    let gate = execution
+        .graph
+        .nodes
+        .iter()
+        .find(|node| node.label == "after")
+        .unwrap();
+    let external = execution
+        .graph
+        .nodes
+        .iter()
+        .find(|node| node.label == "step.external_nested")
+        .unwrap();
+    assert!(
+        !execution.graph.edges.iter().any(|edge| edge.from == gate.id
+            && edge.to == external.id
+            && edge.kind == EdgeKind::Orders)
+    );
+}
+
+#[test]
+fn effect_root_forced_by_later_guard_and_result_dispatches_once() {
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(effect_descriptor("audit.once", vec![], Schema::Boolean))
+        .unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let runtime = Runtime::builder()
+        .registry(registry)
+        .tool("audit.once", {
+            let calls = calls.clone();
+            move |_, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(CanonicalValue::Boolean(true))
+            }
+        })
+        .build()
+        .unwrap();
+    let source = "recorded = audit.once()\nassert(recorded)\nreturn recorded";
+    let execution = runtime.run(&runtime.compile(source).unwrap()).unwrap();
+    assert_eq!(execution.value, CanonicalValue::Boolean(true));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        execution
+            .graph
+            .nodes
+            .iter()
+            .filter(|node| node.label == "audit.once")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn effect_roots_run_when_referenced_only_by_untaken_branches() {
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(effect_descriptor("audit.branch", vec![], Schema::Boolean))
+        .unwrap();
+    registry
+        .register(effect_descriptor("audit.argument", vec![], Schema::Boolean))
+        .unwrap();
+    registry
+        .register(descriptor("accept", vec![Schema::Boolean], Schema::Boolean))
+        .unwrap();
+    let branch_calls = Arc::new(AtomicUsize::new(0));
+    let argument_calls = Arc::new(AtomicUsize::new(0));
+    let runtime = Runtime::builder()
+        .registry(registry)
+        .tool("audit.branch", {
+            let calls = branch_calls.clone();
+            move |_, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(true.into())
+            }
+        })
+        .tool("audit.argument", {
+            let calls = argument_calls.clone();
+            move |_, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(true.into())
+            }
+        })
+        .tool("accept", |args, _| Ok(args[0].clone()))
+        .build()
+        .unwrap();
+    let source = "branch = audit.branch()\nargument = audit.argument()\nselected = if false { return branch } else { return true }\nreturn accept(if false { return argument } else { return selected })";
+    let execution = runtime.run(&runtime.compile(source).unwrap()).unwrap();
+    assert_eq!(execution.value, CanonicalValue::Boolean(true));
+    assert_eq!(branch_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(argument_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn failed_cached_outer_binding_is_evaluated_again_by_boundary_retry() {
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(descriptor("flaky_outer", vec![], Schema::INTEGER))
+        .unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let runtime = Runtime::builder()
+        .registry(registry)
+        .tool("flaky_outer", {
+            let calls = calls.clone();
+            move |_, _| {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(ToolError::new("TEMP", "retry me").retryable(true))
+                } else {
+                    Ok(7.into())
+                }
+            }
+        })
+        .build()
+        .unwrap();
+    let source = "outer = flaky_outer()\nresult = boundary retry 1 { return outer } catch err { return -1 }\nreturn result";
+    let execution = runtime.run(&runtime.compile(source).unwrap()).unwrap();
+    assert_eq!(execution.value, CanonicalValue::Integer(7));
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn after_keeps_outer_binding_in_an_untaken_branch_lazy() {
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(descriptor("must_not_run_after", vec![], Schema::INTEGER))
+        .unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let runtime = Runtime::builder()
+        .registry(registry)
+        .tool("must_not_run_after", {
+            let calls = calls.clone();
+            move |_, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(ToolError::new("WRONG_BRANCH", "must remain lazy"))
+            }
+        })
+        .build()
+        .unwrap();
+    let source = "outer = must_not_run_after()\nordered = after true { return if false { return outer } else { return 7 } }\nreturn ordered";
+    let execution = runtime.run(&runtime.compile(source).unwrap()).unwrap();
+    assert_eq!(execution.value, CanonicalValue::Integer(7));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn after_is_a_contextual_object_property_name() {
+    let runtime = Runtime::builder().build().unwrap();
+    let program = runtime.compile("return { after: 1 }").unwrap();
+    let execution = runtime.run(&program).unwrap();
+    assert_eq!(
+        execution.value,
+        CanonicalValue::Object(BTreeMap::from([("after".into(), 1.into())]))
+    );
 }
