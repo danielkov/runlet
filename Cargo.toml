@@ -1,6 +1,6 @@
 [package]
 name = "runlet"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 rust-version = "1.85"
 authors = ["Daniel Kovacs"]
@@ -22,6 +22,3 @@ serde_json = "1"
 sha2 = "0.11"
 thiserror = "2"
 unicode-ident = "1"
-
-[dev-dependencies]
-pretty_assertions = "1"
