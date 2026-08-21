@@ -35,11 +35,12 @@ pub struct Stmt {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 /// Kind-specific statement data.
 pub enum StmtKind {
-    /// Immutable local binding.
+    /// Immutable local binding, or an eager discard when the name is `_`.
     Binding {
-        /// Name introduced in the current scope.
+        /// Name introduced in the current scope. `_` discards the value and
+        /// does not introduce a name.
         name: String,
-        /// Lazily evaluated bound expression.
+        /// Lazily evaluated bound expression, except discards are eager roots.
         value: Expr,
     },
     /// `skip [if condition]` — abandons the current `for` iteration (the
@@ -60,11 +61,24 @@ pub enum StmtKind {
 }
 
 impl Stmt {
-    /// The name/value pair when this statement is a binding.
+    /// The name/value pair when this statement is a binding, including `_`.
     pub fn binding(&self) -> Option<(&String, &Expr)> {
         match &self.kind {
             StmtKind::Binding { name, value } => Some((name, value)),
             StmtKind::Skip { .. } | StmtKind::Assert { .. } => None,
+        }
+    }
+
+    /// The name/value pair when this statement introduces a readable binding.
+    pub fn introduced_binding(&self) -> Option<(&String, &Expr)> {
+        self.binding().filter(|(name, _)| name.as_str() != "_")
+    }
+
+    /// The eagerly evaluated expression when this is an `_ = expression` discard.
+    pub fn discard_expression(&self) -> Option<&Expr> {
+        match &self.kind {
+            StmtKind::Binding { name, value } if name == "_" => Some(value),
+            StmtKind::Binding { .. } | StmtKind::Skip { .. } | StmtKind::Assert { .. } => None,
         }
     }
 }

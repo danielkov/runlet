@@ -87,6 +87,10 @@ impl Analyzer<'_> {
         let scope = self.scopes.len() - 1;
         let mut defs = BTreeMap::new();
         for s in stmts {
+            if let Some(value) = s.discard_expression() {
+                self.expr(value);
+                continue;
+            }
             let (name, value) = match &s.kind {
                 crate::StmtKind::Binding { name, value } => (name, value),
                 crate::StmtKind::Skip { condition } => {
@@ -156,6 +160,10 @@ impl Analyzer<'_> {
         // names they reference are reachable, so a pure helper used only by
         // a fire-and-forget write or a guard condition is not dead.
         for s in stmts {
+            if let Some(value) = s.discard_expression() {
+                collect_names(value, &defs, &mut used);
+                continue;
+            }
             match &s.kind {
                 crate::StmtKind::Binding { name, value } => {
                     if contains_effectful_call(value, self.registry) {
@@ -176,7 +184,7 @@ impl Analyzer<'_> {
             }
         }
         for s in stmts {
-            let Some((name, value)) = s.binding() else {
+            let Some((name, value)) = s.introduced_binding() else {
                 continue;
             };
             if !used.contains(name) {
@@ -657,7 +665,7 @@ impl Analyzer<'_> {
     fn warn_independent_effects(&mut self, accumulator: &str, body: &crate::Block) {
         let mut defs = BTreeMap::new();
         for s in &body.statements {
-            if let crate::StmtKind::Binding { name, value } = &s.kind {
+            if let Some((name, value)) = s.introduced_binding() {
                 defs.insert(name.clone(), value);
             }
         }
@@ -961,11 +969,16 @@ fn collect_block_names(
 ) {
     let mut extended = defs.clone();
     for stmt in &block.statements {
-        if let crate::StmtKind::Binding { name, value } = &stmt.kind {
+        if let Some((name, value)) = stmt.introduced_binding() {
             extended.insert(name.clone(), value);
         }
     }
     collect_names(&block.result, &extended, used);
+    for stmt in &block.statements {
+        if let Some(value) = stmt.discard_expression() {
+            collect_names(value, &extended, used);
+        }
+    }
     // Guards always evaluate when the block runs; their expressions are
     // reachable regardless of the block result.
     for stmt in &block.statements {
@@ -1554,16 +1567,26 @@ pub(crate) fn free_names_in_block(block: &crate::Block) -> BTreeSet<String> {
     fn block_names(block: &crate::Block, outer: &BTreeSet<String>, free: &mut BTreeSet<String>) {
         let mut bound = outer.clone();
         for statement in &block.statements {
-            if let crate::StmtKind::Binding { name, .. } = &statement.kind {
+            if let Some((name, _)) = statement.introduced_binding() {
                 bound.insert(name.clone());
             }
         }
+
+        // A guard partitions block execution. Work after the first guard,
+        // including the result, is conditional on that guard succeeding.
+        let mut saw_guard = false;
         for statement in &block.statements {
-            match &statement.kind {
-                crate::StmtKind::Binding { value, .. } if contains_call(value) => {
+            if let Some(value) = statement.discard_expression() {
+                expression(value, &bound, free);
+                continue;
+            }
+            if let Some((_, value)) = statement.introduced_binding() {
+                if contains_call(value) {
                     expression(value, &bound, free);
                 }
-                crate::StmtKind::Binding { .. } => {}
+                continue;
+            }
+            match &statement.kind {
                 crate::StmtKind::Skip { condition } => {
                     if let Some(condition) = condition {
                         expression(condition, &bound, free);
@@ -1572,9 +1595,14 @@ pub(crate) fn free_names_in_block(block: &crate::Block) -> BTreeSet<String> {
                 crate::StmtKind::Assert { condition, .. } => {
                     expression(condition, &bound, free);
                 }
+                crate::StmtKind::Binding { .. } => unreachable!("bindings handled above"),
             }
+            saw_guard = true;
+            break;
         }
-        expression(&block.result, &bound, free);
+        if !saw_guard {
+            expression(&block.result, &bound, free);
+        }
     }
     let mut free = BTreeSet::new();
     block_names(block, &BTreeSet::new(), &mut free);
@@ -1590,7 +1618,7 @@ pub(crate) fn after_body_references(
 ) -> BTreeSet<String> {
     let defs = statements
         .iter()
-        .filter_map(|statement| statement.binding())
+        .filter_map(|statement| statement.introduced_binding())
         .map(|(name, value)| (name.clone(), value))
         .collect::<BTreeMap<_, _>>();
     fn visit(

@@ -219,7 +219,7 @@ impl Runtime {
             root.insert(n.clone(), Binding::Value(v.clone(), None));
         }
         for s in &program.program.statements {
-            if let crate::StmtKind::Binding { name, value } = &s.kind {
+            if let Some((name, value)) = s.introduced_binding() {
                 root.insert(name.clone(), Binding::Expr(value.clone()));
             }
         }
@@ -1398,7 +1398,7 @@ impl Evaluator<'_> {
     fn block(&mut self, b: &Block) -> Result<V, ToolError> {
         let mut scope = HashMap::new();
         for s in &b.statements {
-            if let crate::StmtKind::Binding { name, value } = &s.kind {
+            if let Some((name, value)) = s.introduced_binding() {
                 scope.insert(name.clone(), Binding::Expr(value.clone()));
             }
         }
@@ -1521,17 +1521,18 @@ impl Evaluator<'_> {
         all_statements: &[crate::Stmt],
         result: Option<&Expr>,
     ) -> Result<Option<V>, ToolError> {
-        let candidates = group
-            .iter()
-            .filter_map(|statement| match &statement.kind {
-                crate::StmtKind::Binding { name, value }
-                    if crate::analyzer::contains_effectful_call(value, &self.runtime.registry) =>
-                {
-                    Some((name, statement.span, value))
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
+        let candidates =
+            group
+                .iter()
+                .filter_map(|statement| {
+                    if let Some(value) = statement.discard_expression() {
+                        return Some((None, statement.span, value));
+                    }
+                    let (name, value) = statement.introduced_binding()?;
+                    crate::analyzer::contains_effectful_call(value, &self.runtime.registry)
+                        .then_some((Some(name), statement.span, value))
+                })
+                .collect::<Vec<_>>();
         let mut independent_after_inputs = std::collections::BTreeSet::new();
         for (_, _, expression) in &candidates {
             independent_after_inputs.extend(crate::analyzer::after_body_references(
@@ -1550,26 +1551,29 @@ impl Evaluator<'_> {
         // here; names in untaken branches stay lazy.
         let mut tasks = all_statements
             .iter()
-            .filter_map(|statement| match &statement.kind {
-                crate::StmtKind::Binding { name, .. }
-                    if independent_after_inputs.contains(name) =>
-                {
-                    Some(Expr {
-                        kind: ExprKind::Name(name.clone()),
-                        span: statement.span,
-                    })
-                }
-                _ => None,
+            .filter_map(|statement| {
+                let (name, _) = statement.introduced_binding()?;
+                independent_after_inputs.contains(name).then(|| Expr {
+                    kind: ExprKind::Name(name.clone()),
+                    span: statement.span,
+                })
             })
             .collect::<Vec<_>>();
         // Every effectful candidate gets its own scheduling task. References
         // from another candidate or from the result must not suppress it: that
         // analysis is necessarily branch-blind. The binding cache provides
         // single-flight deduplication when a taken dataflow also demands it.
-        tasks.extend(candidates.into_iter().map(|(name, span, _)| Expr {
-            kind: ExprKind::Name(name.clone()),
-            span,
-        }));
+        tasks.extend(
+            candidates
+                .into_iter()
+                .map(|(name, span, value)| match name {
+                    None => value.clone(),
+                    Some(name) => Expr {
+                        kind: ExprKind::Name(name.clone()),
+                        span,
+                    },
+                }),
+        );
         let result_index = result.map(|expression| {
             let index = tasks.len();
             tasks.push(expression.clone());

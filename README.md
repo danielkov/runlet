@@ -78,7 +78,7 @@ inspectable execution graph built into the language.
 | Make correct concurrency the default | Tool outputs behave like ordinary values; references create graph edges and independent nodes can run together. |
 | Keep programs easy for models to produce | The language has bindings, expressions, objects, lists, `for`, conditionals, boundaries, and `return`—but no imports, classes, functions, threads, or visible type syntax. |
 | Catch mistakes before tools run | The host registers every tool with input and output schemas. The analyzer checks names, calls, projections, operators, branches, and returned values. |
-| Avoid accidental effects, keep intended ones | Pure work is lazy and root-reachable: an unused pure computation is pruned with a warning, never dispatched. Statements containing effectful calls are implicit roots — independent roots run concurrently, while `after prerequisite { ... }` expresses required ordering. |
+| Avoid accidental effects, keep intended ones | Pure work is lazy and root-reachable: an unused named pure computation is pruned with a warning, while `_ = expression` explicitly evaluates and discards any result. Statements containing effectful calls and discard statements are implicit roots — independent roots run concurrently, while `after prerequisite { ... }` expresses required ordering. |
 | Bound dynamic work | The host caps active `for` iterations while preserving result order. |
 | Make failure handling explicit | `boundary retry N { ... } catch err { ... }` owns a subgraph, retries retryable failures, and produces a normal fallback value. |
 | Let hosts retain control | The embedder supplies the complete tool registry, implementations, schemas, execution policies, and external inputs. |
@@ -118,7 +118,7 @@ return {
 
 The main rules are deliberately compact:
 
-- Assignments create immutable bindings.
+- Assignments create immutable bindings. `_ = expression` discards the value but always evaluates the expression; it may repeat and introduces no readable name.
 - A program and every block end with `return`.
 - Objects and lists are ordinary structured values; `{ [expr]: value }`
   computes a property key, and `left + right` merges two objects shallowly
@@ -132,7 +132,7 @@ The main rules are deliberately compact:
   condition` drops an element.
 - `fold acc = init for item in items { ... }` reduces sequentially; the
   body's `return` becomes the next accumulator.
-- Independent implicit effect roots run concurrently. `after prerequisite { ...
+- Independent implicit effect and discard roots run concurrently. `after prerequisite { ...
   return value }` gates calls lexically created in its block (including nested
   branch/loop calls) without retroactively gating calls declared outside it.
   Lists or objects can join multiple prerequisites.

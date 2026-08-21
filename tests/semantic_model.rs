@@ -127,6 +127,68 @@ fn effect_descriptor(name: &str, input: Vec<Schema>, output: Schema) -> ToolDesc
 }
 
 #[test]
+fn discard_bindings_repeat_and_force_pure_calls() {
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(descriptor("pure.tick", vec![Schema::INTEGER], Schema::Null))
+        .unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let runtime = Runtime::builder()
+        .registry(registry)
+        .tool("pure.tick", {
+            let calls = calls.clone();
+            move |_, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(CanonicalValue::Null)
+            }
+        })
+        .build()
+        .unwrap();
+    let program = runtime
+        .compile("_ = pure.tick(1)\n_ = pure.tick(2)\nreturn 7")
+        .expect("discard bindings may repeat");
+    assert!(
+        program.diagnostics.iter().all(|d| d.code != "RL1205"),
+        "discard roots are not pruned: {:?}",
+        program.diagnostics
+    );
+    assert_eq!(runtime.run(&program).unwrap().value, 7.into());
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+    let duplicates = runtime
+        .compile("value = 1\nvalue = 2\nreturn value")
+        .expect_err("ordinary bindings remain immutable");
+    assert!(duplicates.iter().any(|d| d.code == "RL2106"));
+}
+
+#[test]
+fn discard_binding_introduces_no_readable_name() {
+    let runtime = Runtime::builder().build().unwrap();
+    let diagnostics = runtime
+        .compile("_ = 1\nreturn _")
+        .expect_err("a discard cannot be read");
+    assert!(diagnostics.iter().any(|d| d.code == "RL2101"));
+}
+
+#[test]
+fn discard_failures_propagate_to_boundaries() {
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(descriptor("pure.fail", vec![], Schema::Null))
+        .unwrap();
+    let runtime = Runtime::builder()
+        .registry(registry)
+        .tool("pure.fail", |_, _| {
+            Err(ToolError::new("STOP", "discard failed"))
+        })
+        .build()
+        .unwrap();
+    let source = "outcome = boundary {\n  _ = pure.fail()\n  return \"wrong\"\n} catch err { return err.code }\nreturn outcome";
+    let execution = runtime.run(&runtime.compile(source).unwrap()).unwrap();
+    assert_eq!(execution.value, CanonicalValue::String("STOP".into()));
+}
+
+#[test]
 fn unused_effectful_calls_execute_as_concurrent_implicit_roots() {
     // A statement containing an effectful call is an implicit root: it runs
     // when its block runs, independently of source order, whether or not the
@@ -1749,6 +1811,47 @@ fn after_orders_a_block_behind_its_prerequisite() {
 }
 
 #[test]
+fn discard_after_orders_its_pure_call() {
+    let mut registry = ToolRegistry::new();
+    for name in ["pepe", "popo", "peepo"] {
+        registry
+            .register(descriptor(name, vec![], Schema::Null))
+            .unwrap();
+    }
+    let stage = Arc::new(AtomicUsize::new(0));
+    let runtime = Runtime::builder()
+        .registry(registry)
+        .tool("pepe", {
+            let stage = stage.clone();
+            move |_, _| {
+                assert_eq!(stage.fetch_add(1, Ordering::SeqCst), 0);
+                Ok(CanonicalValue::Null)
+            }
+        })
+        .tool("popo", {
+            let stage = stage.clone();
+            move |_, _| {
+                assert_eq!(stage.fetch_add(1, Ordering::SeqCst), 1);
+                Ok(CanonicalValue::Null)
+            }
+        })
+        .tool("peepo", {
+            let stage = stage.clone();
+            move |_, _| {
+                assert_eq!(stage.fetch_add(1, Ordering::SeqCst), 2);
+                Ok(CanonicalValue::Null)
+            }
+        })
+        .build()
+        .unwrap();
+    let source = "one = pepe()\ntwo = after one {\n  return popo()\n}\n_ = after two {\n  return peepo()\n}\nreturn null";
+    let program = runtime.compile(source).unwrap();
+    assert!(program.diagnostics.is_empty(), "{:?}", program.diagnostics);
+    assert_eq!(runtime.run(&program).unwrap().value, CanonicalValue::Null);
+    assert_eq!(stage.load(Ordering::SeqCst), 3);
+}
+
+#[test]
 fn after_parser_preserves_prerequisite_and_block_ast() {
     let program =
         parse("ordered = after [first, second] {\n  local = 7\n  return local\n}\nreturn ordered")
@@ -2160,6 +2263,32 @@ fn failed_cached_outer_binding_is_evaluated_again_by_boundary_retry() {
     let execution = runtime.run(&runtime.compile(source).unwrap()).unwrap();
     assert_eq!(execution.value, CanonicalValue::Integer(7));
     assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn failing_after_guard_does_not_preschedule_later_outer_discard() {
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(descriptor("must_not_run_after_guard", vec![], Schema::Null))
+        .unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let runtime = Runtime::builder()
+        .registry(registry)
+        .tool("must_not_run_after_guard", {
+            let calls = calls.clone();
+            move |_, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(CanonicalValue::Null)
+            }
+        })
+        .build()
+        .unwrap();
+    let source = "outer = must_not_run_after_guard()\nordered = after true {\n  assert(false)\n  _ = outer\n  return null\n}\nreturn ordered";
+    let error = runtime
+        .run(&runtime.compile(source).unwrap())
+        .expect_err("the assertion must fail");
+    assert_eq!(error.code, "ASSERTION_FAILED");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
 
 #[test]
