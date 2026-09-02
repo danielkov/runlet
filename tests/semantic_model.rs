@@ -1,7 +1,7 @@
 use runlet::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 fn object(fields: Vec<(&str, Schema)>) -> Schema {
@@ -388,17 +388,25 @@ return { fixed: fold n = 0 for r in results { return n + r.fixed } }"#;
     );
     let dispatched = updates.lock().unwrap().clone();
     assert_eq!(dispatched.len(), 2, "CT-1 phone fix and CT-3 company fill");
-    let CanonicalValue::Object(first) = &dispatched[0] else {
-        panic!()
-    };
+    let dispatched = dispatched
+        .into_iter()
+        .map(|value| {
+            let CanonicalValue::Object(value) = value else {
+                panic!()
+            };
+            let CanonicalValue::String(id) = &value["id"] else {
+                panic!()
+            };
+            (id.clone(), value)
+        })
+        .collect::<BTreeMap<_, _>>();
+    let first = &dispatched["CT-1"];
     assert_eq!(
         first["phone"],
         CanonicalValue::String("+14155550102".into())
     );
     assert!(!first.contains_key("company"), "null company omitted");
-    let CanonicalValue::Object(second) = &dispatched[1] else {
-        panic!()
-    };
+    let second = &dispatched["CT-3"];
     assert_eq!(second["company"], CanonicalValue::String("Umbrella".into()));
     assert!(!second.contains_key("phone"), "null phone omitted");
 }
@@ -581,6 +589,48 @@ fn host_loop_concurrency_bounds_parallel_execution_and_streams_graph_events() {
         event.change,
         GraphChange::NodeUpdated(ref node) if node.state == NodeState::Running
     )));
+}
+
+#[test]
+fn first_loop_iteration_participates_in_concurrency() {
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(descriptor("slow", vec![Schema::INTEGER], Schema::INTEGER))
+        .unwrap();
+    let state = Arc::new((Mutex::new((0usize, false)), Condvar::new()));
+    let runtime = Runtime::builder()
+        .registry(registry)
+        .loop_concurrency(2)
+        .tool("slow", {
+            let state = state.clone();
+            move |args, _| {
+                let (lock, ready) = &*state;
+                let mut started = lock.lock().unwrap();
+                started.0 += 1;
+                ready.notify_all();
+                let (mut started, timeout) = ready
+                    .wait_timeout_while(started, Duration::from_secs(1), |state| state.0 < 2)
+                    .unwrap();
+                if timeout.timed_out() && started.0 < 2 {
+                    started.1 = true;
+                }
+                Ok(args[0].clone())
+            }
+        })
+        .build()
+        .unwrap();
+    let program = runtime
+        .compile("return for x in [1, 2] { return slow(x) }")
+        .unwrap();
+
+    assert_eq!(
+        runtime.run(&program).unwrap().value,
+        CanonicalValue::List((1..=2).map(CanonicalValue::Integer).collect())
+    );
+    assert!(
+        !state.0.lock().unwrap().1,
+        "iteration 0 completed before iteration 1 was allowed to start"
+    );
 }
 
 #[test]
@@ -819,7 +869,7 @@ fn chained_lazy_loop_bindings_evaluate_linearly() {
     // Regression: a binding referenced only inside a loop body used to be
     // re-evaluated by every iteration; chains of such loops re-evaluated
     // exponentially (width^depth) and could exhaust memory. The shared
-    // binding cache plus the sequential first iteration keep it linear.
+    // single-flight binding cache keeps it linear even when iterations race.
     let mut registry = ToolRegistry::new();
     registry
         .register(descriptor("fetch", vec![Schema::INTEGER], Schema::INTEGER))

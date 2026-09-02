@@ -1217,11 +1217,9 @@ impl Evaluator<'_> {
             }
         };
         let values = Arc::new(values);
-        // Iteration 0 runs sequentially first, remaining iterations
-        // concurrently.
-        let next = Arc::new(AtomicUsize::new(1));
+        let next = Arc::new(AtomicUsize::new(0));
         let results = Arc::new(Mutex::new(vec![None; values.len()]));
-        let worker_count = (concurrency as usize).min(values.len().saturating_sub(1));
+        let worker_count = (concurrency as usize).min(values.len());
         // Iterations share one cache of outer bindings they force, so a
         // binding referenced only inside the body evaluates once, not once
         // per iteration (see [`BindingCache`]).
@@ -1264,13 +1262,6 @@ impl Evaluator<'_> {
                 }
             }
         };
-        // Running the first iteration before spawning workers warms the
-        // binding cache: every outer binding the body forces is published
-        // before any concurrent iteration can race to re-evaluate it.
-        if let Some(value) = values.first().cloned() {
-            let first = run_iteration(self.clone_for_branch(), 0, value);
-            results.lock().unwrap()[0] = Some(first);
-        }
         // The evaluating thread is one of the loop's concurrent lanes; extra
         // worker threads come out of the run-wide budget so nested loops
         // cannot multiply threads without bound. A loop that gets no extra

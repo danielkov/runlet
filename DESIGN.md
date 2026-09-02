@@ -250,6 +250,8 @@ Concurrency is host policy, configured with `RuntimeBuilder::loop_concurrency`.
 Source programs cannot override it because agents do not know provider quotas,
 runtime load, or tool safety constraints. The configured value bounds active
 iteration scopes, not merely individual tool calls, and never means unbounded.
+Every iteration, including index 0, participates in bounded concurrent
+scheduling; run-wide worker and dispatch limits can further constrain it.
 
 Result order matches input order, independent of completion order. A failed iteration fails the loop node and cancels its unfinished sibling iterations unless a boundary inside the body catches the failure. A boundary outside the loop treats the complete loop as part of its attempt.
 
