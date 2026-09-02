@@ -36,8 +36,33 @@ module.exports = grammar({
         "}",
       ),
 
+    fold_block: ($) =>
+      seq(
+        "{",
+        repeat(
+          choice($.binding_statement, $.skip_statement, $.break_statement, $.assert_statement),
+        ),
+        $.return_statement,
+        "}",
+      ),
+
     skip_statement: ($) =>
-      seq("skip", optional(seq("if", field("condition", $._expression))), optional(";")),
+      seq(
+        "skip",
+        optional(seq("if", field("condition", $._conditional_or_expression))),
+        optional(";"),
+      ),
+
+    break_statement: ($) =>
+      prec.right(
+        PREC.or,
+        seq(
+          "break",
+          field("value", $._conditional_or_expression),
+          optional(seq("if", field("condition", $._conditional_or_expression))),
+          optional(";"),
+        ),
+      ),
 
     assert_statement: ($) =>
       seq(
@@ -49,9 +74,10 @@ module.exports = grammar({
         optional(";"),
       ),
 
-    _expression: ($) =>
+    _expression: ($) => choice($.conditional_expression, $._conditional_or_expression),
+
+    _conditional_or_expression: ($) =>
       choice(
-        $.conditional_expression,
         $.binary_expression,
         $.unary_expression,
         $.member_expression,
@@ -61,6 +87,7 @@ module.exports = grammar({
         $.for_expression,
         $.fold_expression,
         $.fail_expression,
+        $.after_expression,
         $.boundary_expression,
         $._primary_expression,
       ),
@@ -155,7 +182,7 @@ module.exports = grammar({
         field("binding", $.identifier),
         "in",
         field("collection", $._expression),
-        field("body", $.block),
+        field("body", $.fold_block),
       ),
 
     fail_expression: ($) =>
@@ -165,6 +192,9 @@ module.exports = grammar({
         optional(seq($._expression, repeat(seq(",", $._expression)), optional(","))),
         ")",
       ),
+
+    after_expression: ($) =>
+      seq("after", field("prerequisite", $._expression), field("body", $.block)),
 
     boundary_expression: ($) =>
       seq(
@@ -217,8 +247,8 @@ module.exports = grammar({
     field_name: ($) =>
       choice(
         $.identifier,
-        "return", "for", "in", "boundary", "retry", "catch", "if", "else",
-        "fold", "skip", "assert", "fail", "and", "or", "not", "null", "true", "false",
+        "return", "for", "in", "after", "boundary", "retry", "catch", "if", "else",
+        "fold", "skip", "break", "assert", "fail", "and", "or", "not", "null", "true", "false",
       ),
     identifier: (_) => /[_\p{L}][_\p{L}\p{M}\p{N}]*/,
     null: (_) => "null",

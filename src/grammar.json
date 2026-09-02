@@ -127,6 +127,47 @@
         }
       ]
     },
+    "fold_block": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "STRING",
+          "value": "{"
+        },
+        {
+          "type": "REPEAT",
+          "content": {
+            "type": "CHOICE",
+            "members": [
+              {
+                "type": "SYMBOL",
+                "name": "binding_statement"
+              },
+              {
+                "type": "SYMBOL",
+                "name": "skip_statement"
+              },
+              {
+                "type": "SYMBOL",
+                "name": "break_statement"
+              },
+              {
+                "type": "SYMBOL",
+                "name": "assert_statement"
+              }
+            ]
+          }
+        },
+        {
+          "type": "SYMBOL",
+          "name": "return_statement"
+        },
+        {
+          "type": "STRING",
+          "value": "}"
+        }
+      ]
+    },
     "skip_statement": {
       "type": "SEQ",
       "members": [
@@ -149,7 +190,7 @@
                   "name": "condition",
                   "content": {
                     "type": "SYMBOL",
-                    "name": "_expression"
+                    "name": "_conditional_or_expression"
                   }
                 }
               ]
@@ -172,6 +213,64 @@
           ]
         }
       ]
+    },
+    "break_statement": {
+      "type": "PREC_RIGHT",
+      "value": 2,
+      "content": {
+        "type": "SEQ",
+        "members": [
+          {
+            "type": "STRING",
+            "value": "break"
+          },
+          {
+            "type": "FIELD",
+            "name": "value",
+            "content": {
+              "type": "SYMBOL",
+              "name": "_conditional_or_expression"
+            }
+          },
+          {
+            "type": "CHOICE",
+            "members": [
+              {
+                "type": "SEQ",
+                "members": [
+                  {
+                    "type": "STRING",
+                    "value": "if"
+                  },
+                  {
+                    "type": "FIELD",
+                    "name": "condition",
+                    "content": {
+                      "type": "SYMBOL",
+                      "name": "_conditional_or_expression"
+                    }
+                  }
+                ]
+              },
+              {
+                "type": "BLANK"
+              }
+            ]
+          },
+          {
+            "type": "CHOICE",
+            "members": [
+              {
+                "type": "STRING",
+                "value": ";"
+              },
+              {
+                "type": "BLANK"
+              }
+            ]
+          }
+        ]
+      }
     },
     "assert_statement": {
       "type": "SEQ",
@@ -244,6 +343,15 @@
         },
         {
           "type": "SYMBOL",
+          "name": "_conditional_or_expression"
+        }
+      ]
+    },
+    "_conditional_or_expression": {
+      "type": "CHOICE",
+      "members": [
+        {
+          "type": "SYMBOL",
           "name": "binary_expression"
         },
         {
@@ -277,6 +385,10 @@
         {
           "type": "SYMBOL",
           "name": "fail_expression"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "after_expression"
         },
         {
           "type": "SYMBOL",
@@ -887,7 +999,7 @@
           "name": "body",
           "content": {
             "type": "SYMBOL",
-            "name": "block"
+            "name": "fold_block"
           }
         }
       ]
@@ -951,6 +1063,31 @@
         {
           "type": "STRING",
           "value": ")"
+        }
+      ]
+    },
+    "after_expression": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "STRING",
+          "value": "after"
+        },
+        {
+          "type": "FIELD",
+          "name": "prerequisite",
+          "content": {
+            "type": "SYMBOL",
+            "name": "_expression"
+          }
+        },
+        {
+          "type": "FIELD",
+          "name": "body",
+          "content": {
+            "type": "SYMBOL",
+            "name": "block"
+          }
         }
       ]
     },
@@ -1300,6 +1437,10 @@
         },
         {
           "type": "STRING",
+          "value": "after"
+        },
+        {
+          "type": "STRING",
           "value": "boundary"
         },
         {
@@ -1325,6 +1466,10 @@
         {
           "type": "STRING",
           "value": "skip"
+        },
+        {
+          "type": "STRING",
+          "value": "break"
         },
         {
           "type": "STRING",
