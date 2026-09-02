@@ -68,9 +68,9 @@ semantics: `for` (host-bounded concurrency), `fold` (sequential reduction),
 
 **`skip` filters.** `skip if cond` inside a `for` body drops the element;
 inside a `fold` body it passes the accumulator through unchanged. Filtering
-is fused into iteration, and totality is preserved: every body path must
-`return` or `skip`, so a forgotten return is still a compile error rather
-than a silently shorter list.
+is fused into iteration, and totality is preserved: every body still has one
+structural final `return`, so a forgotten return is a compile error rather than
+a silently shorter list.
 
 **`fold` reduces.** `fold acc = 0 for x in xs { return acc + x }` is the
 single way to aggregate — there are deliberately no `list.sum`/`count`/`min`
@@ -78,7 +78,8 @@ helpers duplicating it (one way to express a reduction). It also unlocks what
 no intrinsic table could: ordered effect chains and cursor pagination, where
 each iteration depends on the previous result. The analyzer warns (`RL1206`)
 when a fold's effects never touch the accumulator — that work belongs in a
-concurrent `for`.
+concurrent `for` unless a fold-local `break value if condition` makes
+sequential early termination necessary.
 
 **Computed keys accumulate by key.** `{ [expr]: value }` (DESIGN.md 2.2)
 plus the `+` merge operator make `fold` express every keyed reduction —

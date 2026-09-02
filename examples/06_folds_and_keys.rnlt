@@ -11,6 +11,12 @@ total = fold acc = 0 for order in orders {
     return acc + order.amount
 }
 
+# A value-carrying break stops a fold early. The finite list is the bound.
+first_large = fold found = null for order in orders {
+    break order if order.status == "completed" and order.amount >= 50
+    return found
+}
+
 # Computed keys plus the right-biased `+` merge express keyed accumulation.
 by_region = fold acc = {} for order in orders {
     existing = acc[order.region] if order.region in acc else []
@@ -34,4 +40,4 @@ summary = boundary {
     return "unavailable: " + err.code
 }
 
-return { total, by_region, tier, summary }
+return { total, first_large, by_region, tier, summary }

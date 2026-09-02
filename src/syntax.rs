@@ -51,6 +51,15 @@ pub enum StmtKind {
         /// Optional condition; absent means always skip.
         condition: Option<Expr>,
     },
+    /// `break value [if condition]` — stops the enclosing `fold` and yields
+    /// `value` as its final accumulator. Only valid inside fold bodies and
+    /// never across a `boundary`.
+    Break {
+        /// Required final value of the fold.
+        value: Expr,
+        /// Optional condition; absent means always break.
+        condition: Option<Expr>,
+    },
     /// `assert(condition[, message])` — eagerly checks a runtime invariant.
     Assert {
         /// Boolean condition that must hold.
@@ -65,7 +74,7 @@ impl Stmt {
     pub fn binding(&self) -> Option<(&String, &Expr)> {
         match &self.kind {
             StmtKind::Binding { name, value } => Some((name, value)),
-            StmtKind::Skip { .. } | StmtKind::Assert { .. } => None,
+            StmtKind::Skip { .. } | StmtKind::Break { .. } | StmtKind::Assert { .. } => None,
         }
     }
 
@@ -78,7 +87,10 @@ impl Stmt {
     pub fn discard_expression(&self) -> Option<&Expr> {
         match &self.kind {
             StmtKind::Binding { name, value } if name == "_" => Some(value),
-            StmtKind::Binding { .. } | StmtKind::Skip { .. } | StmtKind::Assert { .. } => None,
+            StmtKind::Binding { .. }
+            | StmtKind::Skip { .. }
+            | StmtKind::Break { .. }
+            | StmtKind::Assert { .. } => None,
         }
     }
 }

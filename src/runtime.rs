@@ -207,6 +207,7 @@ impl Runtime {
             dispatch_generations: Arc::new(Mutex::new(HashMap::new())),
             operation_nodes: Arc::new(Mutex::new(HashMap::new())),
             last_output: None,
+            break_value: None,
             binding_caches: vec![],
             depth: 0,
             dispatches: Arc::new(DispatchSemaphore::new(self.max_active_dispatches)),
@@ -427,6 +428,9 @@ struct Evaluator<'a> {
     dispatch_generations: Arc<Mutex<HashMap<String, u32>>>,
     operation_nodes: Arc<Mutex<HashMap<String, usize>>>,
     last_output: Option<usize>,
+    /// Value carried by an internal fold break. The private side channel makes
+    /// the public ToolError code impossible for user code or tools to forge.
+    break_value: Option<V>,
     binding_caches: Vec<(usize, BindingCache)>,
     depth: usize,
     dispatches: Arc<DispatchSemaphore>,
@@ -796,8 +800,8 @@ impl Evaluator<'_> {
     }
     /// `fold acc = init for x in xs { ... }` — a sequential left fold. Each
     /// iteration binds a fresh accumulator and item; the body result becomes
-    /// the next accumulator; a taken `skip` leaves the accumulator unchanged;
-    /// an empty collection yields the initial value.
+    /// the next accumulator; `skip` leaves it unchanged; `break value` stops
+    /// with that final accumulator; an empty collection yields the initial value.
     fn fold_expr(
         &mut self,
         span: Span,
@@ -857,6 +861,7 @@ impl Evaluator<'_> {
                 (accumulator.to_string(), Binding::Value(acc.clone(), None)),
                 (binding.to_string(), Binding::Value(value, None)),
             ]));
+            self.break_value = None;
             let result = self.block(body);
             self.scopes.pop();
             self.dynamic.pop();
@@ -869,6 +874,13 @@ impl Evaluator<'_> {
                 // A taken `skip`: the accumulator passes through unchanged.
                 Err(e) if e.code == SKIP_SIGNAL => {
                     self.graph.success(it, acc.clone());
+                }
+                // A taken `break`: its carried value is the fold's final
+                // accumulator, and later iterations are never materialized.
+                Err(e) if e.code == BREAK_SIGNAL && self.break_value.is_some() => {
+                    let value = self.break_value.take().expect("checked break value");
+                    self.graph.success(it, value.clone());
+                    return self.finish(node, Ok(value));
                 }
                 Err(e) => {
                     self.graph.fail(it, e.to_string());
@@ -1419,7 +1431,9 @@ impl Evaluator<'_> {
             for (index, statement) in stmts.iter().enumerate() {
                 if matches!(
                     statement.kind,
-                    crate::StmtKind::Skip { .. } | crate::StmtKind::Assert { .. }
+                    crate::StmtKind::Skip { .. }
+                        | crate::StmtKind::Break { .. }
+                        | crate::StmtKind::Assert { .. }
                 ) {
                     self.concurrent_roots(&stmts[group_start..index], stmts, None)?;
                     self.guard(statement)?;
@@ -1455,6 +1469,34 @@ impl Evaluator<'_> {
                 };
                 if taken {
                     let mut error = lang(SKIP_SIGNAL, "skip");
+                    error.span = Some(statement.span);
+                    Err(error)
+                } else {
+                    Ok(())
+                }
+            }
+            crate::StmtKind::Break { value, condition } => {
+                let taken = match condition {
+                    None => true,
+                    Some(condition) => match self.eval(condition)? {
+                        V::Boolean(value) => value,
+                        other => {
+                            let mut error = lang(
+                                "RL5202",
+                                &format!(
+                                    "break condition evaluated to {}; conditions must be true or false — Runlet has no truthiness, compare explicitly (e.g. `value != null`)",
+                                    value_kind(&other)
+                                ),
+                            );
+                            error.span = Some(condition.span);
+                            return Err(error);
+                        }
+                    },
+                };
+                if taken {
+                    let value = self.eval(value)?;
+                    self.break_value = Some(value);
+                    let mut error = lang(BREAK_SIGNAL, "break");
                     error.span = Some(statement.span);
                     Err(error)
                 } else {
@@ -1668,6 +1710,7 @@ impl Evaluator<'_> {
             dispatch_generations: self.dispatch_generations.clone(),
             operation_nodes: self.operation_nodes.clone(),
             last_output: self.last_output,
+            break_value: None,
             binding_caches: self.binding_caches.clone(),
             depth: self.depth,
             dispatches: self.dispatches.clone(),
@@ -1717,6 +1760,9 @@ fn lang(code: &str, msg: &str) -> ToolError {
 /// `for`/`fold` iteration and never observable by programs (the parser
 /// rejects `skip` outside loop bodies and inside boundaries).
 pub(crate) const SKIP_SIGNAL: &str = "RL4107";
+/// Internal control signal for a value-carrying `break`; intercepted by the
+/// enclosing fold and never observable by programs.
+pub(crate) const BREAK_SIGNAL: &str = "RL4108";
 fn project(v: V, i: &V) -> Result<V, ToolError> {
     match (v, i) {
         (V::List(x), V::Integer(i)) => idx(x.len(), *i)

@@ -45,7 +45,7 @@ The language has no imports, packages, user-defined classes, macros, threads, ex
 
 ### 2.1 Lexical rules
 
-Source is UTF-8. Identifiers use Unicode XID start/continue rules; tool authors SHOULD expose simple ASCII identifiers. The reserved words are `return`, `for`, `in`, `after`, `boundary`, `fold`, `skip`, `assert`, `fail`, `retry`, `catch`, `if`, `else`, `and`, `or`, `not`, `null`, `true`, and `false`. They cannot be binding names or registry roots. A reserved word is permitted contextually as an object property name or after `.`, so `{ assert: true }` and `result.assert` remain natural; quoted/indexed spellings are also valid.
+Source is UTF-8. Identifiers use Unicode XID start/continue rules; tool authors SHOULD expose simple ASCII identifiers. The reserved words are `return`, `for`, `in`, `after`, `boundary`, `fold`, `skip`, `break`, `assert`, `fail`, `retry`, `catch`, `if`, `else`, `and`, `or`, `not`, `null`, `true`, and `false`. They cannot be binding names or registry roots. A reserved word is permitted contextually as an object property name or after `.`, so `{ assert: true }` and `result.assert` remain natural; quoted/indexed spellings are also valid.
 
 Indentation is not significant. A newline terminates a simple statement unless it occurs inside an open `()`, `[]`, or expression-object `{}`, or the preceding token is one of this exhaustive continuation set: `=`, `,`, `:`, `+`, `-`, `*`, `/`, `%`, `==`, `!=`, `<`, `<=`, `>`, `>=`, `and`, `or`, `not`, `in`, `if`, or `else`. Compound `for`, `after`, `boundary`, and `catch` headers must place their opening `{` on the header line; a boundary body's closing `}` and its `catch` must likewise be on one line as `} catch err {`. A newline immediately followed by `(` or `[` never continues the preceding expression; a call/index continuation must remain on the same line or wrap the whole expression in open parentheses. Semicolons may terminate simple statements and are optional immediately before `}`. Comments start with `#` or `//` and continue to end of line. Block comments are deliberately omitted.
 
@@ -61,13 +61,14 @@ Numbers do not silently lose precision. Integer literals are arbitrary precision
 
 ### 2.2 Core grammar
 
-The following EBNF is normative for the version 1 surface grammar. Whitespace, comments, and statement terminators are elided. There are deliberately no effectful expression statements, statement-form control structures, or early returns. `skip` is the one non-binding statement: it is loop-body control (section 2.7.1), not an expression.
+The following EBNF is normative for the version 1 surface grammar. Whitespace, comments, and statement terminators are elided. There are deliberately no effectful expression statements, statement-form control structures, or early returns. `skip` and `break` are loop-body control statements (sections 2.7.1 and 2.7.3), not expressions.
 
 ```ebnf
 program       = ( let_stmt | assert_stmt )* , return_stmt ;
 
 let_stmt      = IDENT , "=" , expression ;
 skip_stmt     = "skip" , ( "if" , conditional_or )? ;   (* for/fold bodies only *)
+break_stmt    = "break" , conditional_or , ( "if" , conditional_or )? ; (* fold bodies only *)
 assert_stmt   = "assert" , "(" , expression , ( "," , expression )? , ")" ;
 return_stmt   = "return" , expression ;
 
@@ -75,7 +76,7 @@ if_expr       = "if" , expression , block_return ,
                 ( "else" , ( if_expr | block_return ) )? ;
 for_expr      = "for" , IDENT , "in" , expression , block_return ;
 fold_expr     = "fold" , IDENT , "=" , expression ,
-                "for" , IDENT , "in" , expression , block_return ;
+                "for" , IDENT , "in" , expression , fold_block_return ;
 fail_expr     = "fail" , "(" , arguments , ")" ;
 after_expr    = "after" , expression , block_return ;
 
@@ -83,6 +84,7 @@ boundary_expr = "boundary" , retry_clause? , block_return , catch_clause_return 
 retry_clause  = "retry" , INTEGER ;
 catch_clause_return = "catch" , IDENT , block_return ;
 block_return  = "{" , ( let_stmt | skip_stmt | assert_stmt )* , return_stmt , "}" ;
+fold_block_return = "{" , ( let_stmt | skip_stmt | break_stmt | assert_stmt )* , return_stmt , "}" ;
 
 expression    = conditional_or ,
                 ( "if" , conditional_or , ( "else" , expression )? )? ;
@@ -295,22 +297,49 @@ order-dependence, exactly as `for` pins host-bounded concurrency and
 `boundary` pins retry. Ordered effect chains and cursor pagination are
 expressible only here.
 
-The accumulator keeps one schema: the body result must convert back to the
-initial value's schema (`RL2313`) — strict one-pass unification rather than
-fixpoint widening, so errors stay legible. One widening is allowed: when the
-initial value converts *structurally* (never by formatting) into the body's
-schema, the accumulator adopts the body's schema. This covers the
-keyed-accumulation idiom — an `{}` seed merging computed-key entries
-(`acc + { [key]: value }`) widens to the map — and the find-first idiom — a
-`null` seed with `return item if match else acc` widens to `Item | Null`.
-Both would otherwise always trip `RL2313`. The analyzer warns (`RL1206`) when
-an effectful statement in a fold body never references the accumulator: the
-fold serializes work that a `for` loop would run concurrently.
+The accumulator keeps one schema: the body result and every `break` value must
+unify with the initial value's schema (`RL2313`). One structural widening is
+allowed and the body is then checked again under that widened schema. This
+covers the keyed-accumulation idiom — an `{}` seed merging computed-key
+entries (`acc + { [key]: value }`) widens to the map — and a `null` seed with
+an object result widens to `Item | Null`. Formatting conversions never widen
+a fold. The analyzer warns (`RL1206`) when an effectful statement in a fold
+body never references the accumulator, unless a `break` makes sequential
+execution necessary.
 
 Named aggregate helpers (`list.sum` and friends) are deliberately absent:
 one way to express a reduction. See STDLIB.md.
 
-### 2.7.3 `assert`
+### 2.7.3 `break`
+
+`break value [if condition]` is valid only as a direct statement of a `fold` body. A taken break ends
+the current iteration and the complete fold; its required value is the fold's
+final accumulator. The value must therefore satisfy the same accumulator
+schema as the initializer and body return. The condition is evaluated first,
+and the value is evaluated only when the condition is true.
+
+```runlet
+attempts = fold results = [] for attempt in list.range(0, 12) {
+    result = deploy.check(build_id)
+    next = results + [result]
+    break next if result.ok
+    return next
+}
+```
+
+The value is mandatory: immutable bindings mean a bare `break` could not say
+whether to preserve the iteration-start accumulator or use a newly computed
+value. Write `break acc` explicitly to stop without changing it. `break` is
+rejected in concurrent `for` bodies, where sibling effects may already be in
+flight, and cannot cross nested `if`, `after`, or `boundary` blocks. The enclosing fold intercepts the
+control signal before an outer boundary observes it. Remaining iterations are
+never materialized.
+
+In a fold, `return v` continues with accumulator `v`; `skip` continues with it
+unchanged; `break v` stops and yields `v`. The fold body still ends with a
+structural final `return` for the path where a guarded break is not taken.
+
+### 2.7.4 `assert`
 
 `assert(condition[, message])` is an eager statement that checks a runtime
 invariant without adding checked data to the program's return value. The
@@ -319,7 +348,7 @@ optional message must be a string (`RL2317`). A false condition raises the
 non-retryable `ASSERTION_FAILED` error; prior tool effects are not rolled
 back.
 
-### 2.7.4 `fail`
+### 2.7.5 `fail`
 
 `fail(code, message[, details])` raises a catchable error, exactly like a
 failing tool call: same `ToolError`, same boundary ownership, span stamped
@@ -1088,7 +1117,7 @@ Exit: security review, fault-injection soak tests, documented SLOs, and versione
 Decided for version 1:
 
 - Pure work is lazy and root-reachable; statements containing effectful calls and `_ = expression` discards are implicit roots, so bound fire-and-forget writes and explicit discards always run.
-- Loop bodies explicitly `return` or `skip`; host concurrency bounds whole iterations.
+- Loop bodies end in `return`; `skip` continues without a value update, and fold-local `break value` terminates sequential reduction early. Host concurrency bounds whole `for` iterations.
 - `for` pins bounded concurrency, `fold` pins sequential reduction, `boundary` pins retry: lambdas exist only at these controlled application sites and are never values.
 - `retry N` means N retries after the first attempt.
 - Conditions have no truthiness.

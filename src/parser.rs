@@ -15,6 +15,7 @@ pub fn parse(source: &str) -> Result<Program, Vec<Diagnostic>> {
         diagnostics: vec![],
         depth: 0,
         skip_allowed: false,
+        break_allowed: false,
     };
     let program = p.program();
     if p.diagnostics.is_empty() {
@@ -49,6 +50,9 @@ struct Parser {
     /// at program level and inside `boundary` blocks (a skip never crosses a
     /// boundary).
     skip_allowed: bool,
+    /// Whether `break` is valid here: true only inside `fold` bodies and
+    /// false across concurrent `for` and error-boundary blocks.
+    break_allowed: bool,
 }
 
 impl Parser {
@@ -107,6 +111,9 @@ impl Parser {
     fn let_stmt(&mut self) -> Option<Stmt> {
         if self.at(&T::Skip) {
             return self.skip_stmt();
+        }
+        if self.at(&T::Break) {
+            return self.break_stmt();
         }
         if self.at(&T::Assert) {
             return self.assert_stmt();
@@ -182,6 +189,47 @@ impl Parser {
         Some(Stmt {
             span: start.join(end),
             kind: StmtKind::Skip { condition },
+        })
+    }
+    fn break_stmt(&mut self) -> Option<Stmt> {
+        let start = self.bump().span;
+        if !self.break_allowed {
+            self.diagnostics.push(Diagnostic::error(
+                "RL1020",
+                Phase::Parse,
+                start,
+                "break outside a fold body",
+                "`break value [if condition]` is only valid directly inside a \
+                 sequential `fold` body and cannot cross a `for` or `boundary`",
+            ));
+            return None;
+        }
+        if self.at(&T::If)
+            || self.at(&T::Newline)
+            || self.at(&T::Semicolon)
+            || self.at(&T::RBrace)
+            || self.at(&T::Eof)
+        {
+            self.diagnostics.push(Diagnostic::error(
+                "RL1021",
+                Phase::Parse,
+                start,
+                "break requires the fold's final value",
+                "write `break accumulator` to stop with the accumulator unchanged, \
+                 or `break next if condition` to stop with an updated value",
+            ));
+            return None;
+        }
+        let value = self.expr(1)?;
+        let condition = if self.take(&T::If) {
+            Some(self.expr(1)?)
+        } else {
+            None
+        };
+        let end = condition.as_ref().map(|c| c.span).unwrap_or(value.span);
+        Some(Stmt {
+            span: start.join(end),
+            kind: StmtKind::Break { value, condition },
         })
     }
     fn assert_stmt(&mut self) -> Option<Stmt> {
@@ -584,7 +632,7 @@ impl Parser {
     /// whose result is the nested conditional.
     fn if_expr(&mut self, start: Span) -> Option<Expr> {
         let condition = Box::new(self.expr(0)?);
-        let then_block = self.block()?;
+        let then_block = self.nested_block()?;
         let mut end = then_block.span;
         // `else` may sit on the next line; consume separators only when it
         // actually follows, so the caller still sees its statement terminator.
@@ -605,7 +653,7 @@ impl Parser {
                     span,
                 })
             } else {
-                let block = self.block()?;
+                let block = self.nested_block()?;
                 end = block.span;
                 Some(block)
             }
@@ -632,7 +680,7 @@ impl Parser {
         };
         self.expect_take(&T::In, "`in`")?;
         let collection = Box::new(self.expr(0)?);
-        let body = self.loop_body()?;
+        let body = self.loop_body(false)?;
         Some(Expr {
             span: start.join(body.span),
             kind: ExprKind::For {
@@ -665,7 +713,7 @@ impl Parser {
         };
         self.expect_take(&T::In, "`in`")?;
         let collection = Box::new(self.expr(0)?);
-        let body = self.loop_body()?;
+        let body = self.loop_body(true)?;
         Some(Expr {
             span: start.join(body.span),
             kind: ExprKind::Fold {
@@ -702,17 +750,31 @@ impl Parser {
             kind: ExprKind::Fail { arguments },
         })
     }
-    /// Parses a `for`/`fold` body with `skip` enabled.
-    fn loop_body(&mut self) -> Option<Block> {
-        let saved = self.skip_allowed;
+    /// Parses a loop body with `skip` enabled and `break` enabled only for
+    /// sequential folds.
+    fn loop_body(&mut self, break_allowed: bool) -> Option<Block> {
+        let saved_skip = self.skip_allowed;
+        let saved_break = self.break_allowed;
         self.skip_allowed = true;
+        self.break_allowed = break_allowed;
         let body = self.block();
-        self.skip_allowed = saved;
+        self.skip_allowed = saved_skip;
+        self.break_allowed = saved_break;
+        body
+    }
+    /// Parses a nested block that cannot transfer `break` control to an
+    /// enclosing fold. Keeping breaks as direct fold-body guards preserves
+    /// statement ordering without non-local expression control flow.
+    fn nested_block(&mut self) -> Option<Block> {
+        let saved = self.break_allowed;
+        self.break_allowed = false;
+        let body = self.block();
+        self.break_allowed = saved;
         body
     }
     fn after_expr(&mut self, start: Span) -> Option<Expr> {
         let prerequisite = Box::new(self.expr(0)?);
-        let body = self.block()?;
+        let body = self.nested_block()?;
         Some(Expr {
             span: start.join(body.span),
             kind: ExprKind::After { prerequisite, body },
@@ -732,10 +794,13 @@ impl Parser {
         };
         // A skip inside a boundary would abandon retry accounting mid-flight;
         // boundary blocks re-disable it.
-        let saved = self.skip_allowed;
+        let saved_skip = self.skip_allowed;
+        let saved_break = self.break_allowed;
         self.skip_allowed = false;
+        self.break_allowed = false;
         let body = self.block();
-        self.skip_allowed = saved;
+        self.skip_allowed = saved_skip;
+        self.break_allowed = saved_break;
         let body = body?;
         if self.at(&T::Newline) || self.at(&T::Semicolon) {
             self.diagnostics.push(Diagnostic::error(
@@ -755,10 +820,13 @@ impl Parser {
                 return None;
             }
         };
-        let saved = self.skip_allowed;
+        let saved_skip = self.skip_allowed;
+        let saved_break = self.break_allowed;
         self.skip_allowed = false;
+        self.break_allowed = false;
         let catch = self.block();
-        self.skip_allowed = saved;
+        self.skip_allowed = saved_skip;
+        self.break_allowed = saved_break;
         let catch = catch?;
         Some(Expr {
             span: start.join(catch.span),
@@ -800,6 +868,7 @@ impl Parser {
             T::Boundary => "boundary".into(),
             T::Fold => "fold".into(),
             T::Skip => "skip".into(),
+            T::Break => "break".into(),
             T::Assert => "assert".into(),
             T::Fail => "fail".into(),
             T::Retry => "retry".into(),
@@ -1016,6 +1085,7 @@ fn is_field_token(t: &T) -> bool {
             | T::Boundary
             | T::Fold
             | T::Skip
+            | T::Break
             | T::Assert
             | T::Fail
             | T::Retry

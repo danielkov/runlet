@@ -42,6 +42,7 @@ pub fn compile(
         registry,
         diagnostics: vec![],
         scopes: vec![],
+        break_schemas: vec![],
         registry_roots: registry.roots().into_iter().map(str::to_owned).collect(),
     };
     let mut root = BTreeMap::new();
@@ -74,6 +75,9 @@ struct Analyzer<'a> {
     registry: &'a ToolRegistry,
     diagnostics: Vec<Diagnostic>,
     scopes: Vec<BTreeMap<String, Schema>>,
+    /// Break values collected for the fold body currently being analyzed.
+    /// Nested folds push their own collector so breaks never escape outward.
+    break_schemas: Vec<Vec<(Span, Schema)>>,
     registry_roots: BTreeSet<String>,
 }
 impl Analyzer<'_> {
@@ -99,6 +103,19 @@ impl Analyzer<'_> {
                         if !boolean_context(&c) {
                             self.err("RL2305", condition.span, "skip condition must be Boolean");
                         }
+                    }
+                    continue;
+                }
+                crate::StmtKind::Break { value, condition } => {
+                    let value_schema = self.expr(value);
+                    if let Some(condition) = condition {
+                        let c = self.expr(condition);
+                        if !boolean_context(&c) {
+                            self.err("RL2305", condition.span, "break condition must be Boolean");
+                        }
+                    }
+                    if let Some(values) = self.break_schemas.last_mut() {
+                        values.push((value.span, value_schema));
                     }
                     continue;
                 }
@@ -175,6 +192,12 @@ impl Analyzer<'_> {
                     condition: Some(condition),
                 } => collect_names(condition, &defs, &mut used),
                 crate::StmtKind::Skip { condition: None } => {}
+                crate::StmtKind::Break { value, condition } => {
+                    collect_names(value, &defs, &mut used);
+                    if let Some(condition) = condition {
+                        collect_names(condition, &defs, &mut used);
+                    }
+                }
                 crate::StmtKind::Assert { condition, message } => {
                     collect_names(condition, &defs, &mut used);
                     if let Some(message) = message {
@@ -551,14 +574,14 @@ impl Analyzer<'_> {
                     (accumulator.clone(), acc.clone()),
                     (binding.clone(), item.clone()),
                 ]));
+                self.break_schemas.push(vec![]);
                 let out = self.block_bindings(&body.statements, &body.result, false);
+                let breaks = self.break_schemas.pop().unwrap_or_default();
                 self.scopes.pop();
-                // The accumulator keeps one schema across iterations; see
-                // fold_unify for the widenings a seed is allowed. When the
-                // seed widens, the body is re-typed under the widened schema
-                // — a `null`-seeded accumulator (or property) otherwise
-                // poisons every projection inside the body.
-                let result = match fold_unify(&acc, &out) {
+                let has_break = !breaks.is_empty();
+                // The body result and every break value participate in the
+                // same structural accumulator widening rules.
+                let result = match fold_unify_with_breaks(&acc, (body.result.span, &out), &breaks) {
                     Ok(unified) => {
                         if unified == acc {
                             unified
@@ -568,14 +591,20 @@ impl Analyzer<'_> {
                                 (accumulator.clone(), unified.clone()),
                                 (binding.clone(), item),
                             ]));
+                            self.break_schemas.push(vec![]);
                             let out = self.block_bindings(&body.statements, &body.result, false);
+                            let breaks = self.break_schemas.pop().unwrap_or_default();
                             self.scopes.pop();
-                            match fold_unify(&unified, &out) {
+                            match fold_unify_with_breaks(
+                                &unified,
+                                (body.result.span, &out),
+                                &breaks,
+                            ) {
                                 Ok(stable) => stable,
-                                Err(detail) => {
+                                Err((span, detail)) => {
                                     self.err(
                                         "RL2313",
-                                        body.result.span,
+                                        span,
                                         &format!("fold accumulator must keep one schema: {detail}"),
                                     );
                                     unified
@@ -583,16 +612,20 @@ impl Analyzer<'_> {
                             }
                         }
                     }
-                    Err(detail) => {
+                    Err((span, detail)) => {
                         self.err(
                             "RL2313",
-                            body.result.span,
+                            span,
                             &format!("fold accumulator must keep one schema: {detail}"),
                         );
                         acc
                     }
                 };
-                self.warn_independent_effects(accumulator, body);
+                // A break itself makes sequential execution necessary even
+                // when an effect does not consume the accumulator directly.
+                if !has_break {
+                    self.warn_independent_effects(accumulator, body);
+                }
                 result
             }
             ExprKind::Fail { arguments } => {
@@ -821,11 +854,14 @@ pub(crate) fn contains_effectful_call(e: &Expr, registry: &ToolRegistry) -> bool
 }
 
 /// Applies a predicate to every statement expression (binding values and
-/// skip conditions) and the result of a block.
+/// guard expressions) and the result of a block.
 fn block_contains(b: &crate::Block, pred: impl Fn(&Expr) -> bool + Copy) -> bool {
     b.statements.iter().any(|statement| match &statement.kind {
         crate::StmtKind::Binding { value, .. } => pred(value),
         crate::StmtKind::Skip { condition } => condition.as_ref().is_some_and(pred),
+        crate::StmtKind::Break { value, condition } => {
+            pred(value) || condition.as_ref().is_some_and(pred)
+        }
         crate::StmtKind::Assert { condition, message } => {
             pred(condition) || message.as_ref().is_some_and(pred)
         }
@@ -986,6 +1022,12 @@ fn collect_block_names(
             crate::StmtKind::Skip {
                 condition: Some(condition),
             } => collect_names(condition, &extended, used),
+            crate::StmtKind::Break { value, condition } => {
+                collect_names(value, &extended, used);
+                if let Some(condition) = condition {
+                    collect_names(condition, &extended, used);
+                }
+            }
             crate::StmtKind::Assert { condition, message } => {
                 collect_names(condition, &extended, used);
                 if let Some(message) = message {
@@ -1294,7 +1336,7 @@ fn binary_schema(op: BinaryOp, l: &Schema, r: &Schema) -> Option<Schema> {
         _ => None,
     }
 }
-/// Unifies a fold accumulator's seed schema with the body's return schema.
+/// Unifies a fold accumulator's seed schema with one body outcome schema.
 ///
 /// The seed keeps its schema when the body converts back to it. Otherwise
 /// one widening is allowed, always structural (never by formatting, so an
@@ -1311,6 +1353,155 @@ fn binary_schema(op: BinaryOp, l: &Schema, r: &Schema) -> Option<Schema> {
 /// spuriously: a union body result also "converts" into a bare seed under
 /// the lenient any-variant rule, which would collapse the fold to the
 /// seed's schema and hide the found values.
+fn fold_unify_with_breaks(
+    acc: &Schema,
+    body: (Span, &Schema),
+    breaks: &[(Span, Schema)],
+) -> Result<Schema, (Span, String)> {
+    let mut unified = fold_unify(acc, body.1).map_err(|detail| (body.0, detail))?;
+    for (span, value) in breaks {
+        if matches!(value, Schema::Never) {
+            continue;
+        }
+        if !fold_any_compatible(value, &unified) {
+            return Err((*span, incompatible_break(&unified, value)));
+        }
+        unified = fold_unify(&unified, value)
+            .map_err(|_| (*span, incompatible_break(&unified, value)))?;
+    }
+    Ok(unified)
+}
+
+fn incompatible_break(acc: &Schema, value: &Schema) -> String {
+    format!(
+        "the accumulator is {} but the break value is {}",
+        acc.kind_name(),
+        value.kind_name()
+    )
+}
+
+fn schema_contains_any(schema: &Schema) -> bool {
+    match schema {
+        Schema::Any => true,
+        Schema::Union { variants, .. } => variants.iter().any(schema_contains_any),
+        Schema::List { items, .. } => schema_contains_any(items),
+        Schema::Map { values } => schema_contains_any(values),
+        Schema::Object { properties, .. } => properties
+            .values()
+            .any(|property| schema_contains_any(&property.schema)),
+        _ => false,
+    }
+}
+
+/// An unknown break value may flow only into an accumulator position that is
+/// already unknown. Other fields may still widen structurally.
+fn fold_any_compatible(actual: &Schema, expected: &Schema) -> bool {
+    if matches!(expected, Schema::Any) {
+        return true;
+    }
+    match (actual, expected) {
+        (Schema::Any, _) => false,
+        (Schema::Union { variants, .. }, expected) => variants
+            .iter()
+            .all(|variant| fold_any_compatible(variant, expected)),
+        (actual, Schema::Union { variants, .. }) => variants
+            .iter()
+            .any(|variant| fold_any_compatible(actual, variant)),
+        (
+            Schema::List { items: actual, .. },
+            Schema::List {
+                items: expected, ..
+            },
+        ) => fold_any_compatible(actual, expected),
+        (Schema::Map { values: actual }, Schema::Map { values: expected }) => {
+            fold_any_compatible(actual, expected)
+        }
+        (
+            Schema::Object {
+                properties: actual, ..
+            },
+            Schema::Object {
+                properties: expected,
+                additional,
+                ..
+            },
+        ) => actual
+            .iter()
+            .all(|(name, property)| match expected.get(name) {
+                Some(target) => fold_any_compatible(&property.schema, &target.schema),
+                None => *additional,
+            }),
+        (Schema::Object { properties, .. }, Schema::Map { values }) => properties
+            .values()
+            .all(|property| fold_any_compatible(&property.schema, values)),
+        _ => !schema_contains_any(actual),
+    }
+}
+
+/// Strict structural compatibility for fold union variants. Unlike callable
+/// conversion, every union variant must fit and formatting conversions are
+/// never accepted.
+fn fold_schema_accepts(actual: &Schema, expected: &Schema) -> bool {
+    if actual == expected || matches!(actual, Schema::Never) || matches!(expected, Schema::Any) {
+        return true;
+    }
+    match (actual, expected) {
+        (Schema::Union { variants, .. }, expected) => variants
+            .iter()
+            .all(|variant| fold_schema_accepts(variant, expected)),
+        (actual, Schema::Union { variants, .. }) => variants
+            .iter()
+            .any(|variant| fold_schema_accepts(actual, variant)),
+        (Schema::String { .. }, Schema::String { .. })
+        | (Schema::Integer { .. }, Schema::Integer { .. })
+        | (Schema::Integer { .. }, Schema::Number { .. })
+        | (Schema::Number { .. }, Schema::Number { .. }) => true,
+        (
+            Schema::List { items: actual, .. },
+            Schema::List {
+                items: expected, ..
+            },
+        )
+        | (Schema::Map { values: actual }, Schema::Map { values: expected }) => {
+            fold_schema_accepts(actual, expected)
+        }
+        (
+            Schema::Object {
+                properties,
+                additional: false,
+                ..
+            },
+            Schema::Map { values },
+        ) => properties
+            .values()
+            .all(|property| fold_schema_accepts(&property.schema, values)),
+        (
+            Schema::Object {
+                properties: actual,
+                required: actual_required,
+                additional: actual_additional,
+            },
+            Schema::Object {
+                properties: expected,
+                required: expected_required,
+                additional: expected_additional,
+            },
+        ) => {
+            (!actual_additional || *expected_additional)
+                && expected_required
+                    .iter()
+                    .all(|name| actual_required.contains(name) && actual.contains_key(name))
+                && actual
+                    .iter()
+                    .all(|(name, property)| match expected.get(name) {
+                        Some(target) => fold_schema_accepts(&property.schema, &target.schema),
+                        None => *expected_additional,
+                    })
+        }
+        _ => false,
+    }
+}
+
 fn fold_unify(acc: &Schema, out: &Schema) -> Result<Schema, String> {
     if acc == out {
         return Ok(acc.clone());
@@ -1321,6 +1512,35 @@ fn fold_unify(acc: &Schema, out: &Schema) -> Result<Schema, String> {
     if matches!(out, Schema::Any) {
         return Ok(Schema::Any);
     }
+    // Fold unions have one structural schema plus optional null. Unify every
+    // output variant instead of accepting a union when only one variant fits.
+    if let Schema::Union { variants, .. } = out {
+        let mut unified = acc.clone();
+        for variant in variants {
+            unified = fold_unify(&unified, variant)?;
+        }
+        return Ok(unified);
+    }
+    if let Schema::Union { variants, .. } = acc {
+        if fold_schema_accepts(out, acc) {
+            return Ok(acc.clone());
+        }
+        for (index, variant) in variants.iter().enumerate() {
+            if matches!(variant, Schema::Null) {
+                continue;
+            }
+            if let Ok(widened) = fold_unify(variant, out) {
+                let mut widened_variants = variants.clone();
+                widened_variants[index] = widened;
+                return Ok(union(widened_variants));
+            }
+        }
+        return Err(format!(
+            "the initial value is {} but the body returns {}",
+            acc.kind_name(),
+            out.kind_name()
+        ));
+    }
     // Structural widenings run before any conversion-rank check: the
     // lenient union-as-actual rank would otherwise "convert" a union body
     // back into the bare seed (at any nesting depth) and hide the found
@@ -1328,6 +1548,18 @@ fn fold_unify(acc: &Schema, out: &Schema) -> Result<Schema, String> {
     match (acc, out) {
         (Schema::Null, other) | (other, Schema::Null) if !matches!(other, Schema::Null) => {
             return Ok(union(vec![other.clone(), Schema::Null]));
+        }
+        (Schema::List { items: a, .. }, Schema::List { items: b, .. }) => {
+            return fold_unify(a, b)
+                .map(Schema::list)
+                .map_err(|detail| format!("list item: {detail}"));
+        }
+        (Schema::Map { values: a }, Schema::Map { values: b }) => {
+            return fold_unify(a, b)
+                .map(|values| Schema::Map {
+                    values: Box::new(values),
+                })
+                .map_err(|detail| format!("map value: {detail}"));
         }
         (
             Schema::Object {
@@ -1355,17 +1587,13 @@ fn fold_unify(acc: &Schema, out: &Schema) -> Result<Schema, String> {
         }
         _ => {}
     }
-    // A union body absorbs a seed that is one of its variants; a non-union
-    // body that converts back keeps the seed's schema — including a
-    // previously widened union seed. Widening by structural conversion
-    // (never formatting) covers the rest (`{}` seed → map).
-    if matches!(out, Schema::Union { .. }) && conversion_rank(acc, out).is_some_and(|r| r <= 2) {
-        return Ok(out.clone());
-    }
-    if conversion_rank(out, acc).is_some() {
+    // A body that converts back keeps the seed's schema. Widening by
+    // structural conversion (never formatting) covers the rest
+    // (`{}` seed → map).
+    if fold_schema_accepts(out, acc) {
         return Ok(acc.clone());
     }
-    if conversion_rank(acc, out).is_some_and(|rank| rank <= 2) {
+    if fold_schema_accepts(acc, out) {
         return Ok(out.clone());
     }
     Err(format!(
@@ -1588,6 +1816,12 @@ pub(crate) fn free_names_in_block(block: &crate::Block) -> BTreeSet<String> {
             }
             match &statement.kind {
                 crate::StmtKind::Skip { condition } => {
+                    if let Some(condition) = condition {
+                        expression(condition, &bound, free);
+                    }
+                }
+                crate::StmtKind::Break { value, condition } => {
+                    expression(value, &bound, free);
                     if let Some(condition) = condition {
                         expression(condition, &bound, free);
                     }

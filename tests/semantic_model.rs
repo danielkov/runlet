@@ -1125,6 +1125,188 @@ fn fold_reduces_sequentially_and_skip_leaves_accumulator_unchanged() {
 }
 
 #[test]
+fn break_remains_legal_as_a_property_name() {
+    let runtime = Runtime::builder().build().unwrap();
+    let source = "value = { break: 7 }\nreturn value.break";
+    let execution = runtime.run(&runtime.compile(source).unwrap()).unwrap();
+    assert_eq!(execution.value, CanonicalValue::Integer(7));
+}
+
+#[test]
+fn fold_break_stops_early_with_its_value() {
+    let runtime = Runtime::builder().build().unwrap();
+    let source = "result = fold acc = 0 for x in [1, 2, 3, 4] {\n  \
+                  break acc + x if x == 3\n  return acc + x\n}\nreturn result";
+    let execution = runtime.run(&runtime.compile(source).unwrap()).unwrap();
+    assert_eq!(execution.value, CanonicalValue::Integer(6));
+}
+
+#[test]
+fn fold_break_guard_is_lazy() {
+    let runtime = Runtime::builder().build().unwrap();
+    let source = "result = fold acc = 0 for x in [1, 2] {\n  \
+                  break [1][99] if false\n  return acc + x\n}\nreturn result";
+    let execution = runtime.run(&runtime.compile(source).unwrap()).unwrap();
+    assert_eq!(execution.value, CanonicalValue::Integer(3));
+}
+
+#[test]
+fn fold_break_requires_a_value_and_a_boolean_guard() {
+    let runtime = Runtime::builder().build().unwrap();
+    let missing = runtime
+        .compile("x = fold acc = 0 for v in [1] { break if true\nreturn acc }\nreturn x")
+        .expect_err("bare break must be rejected");
+    assert_eq!(missing[0].code, "RL1021");
+
+    let non_boolean = runtime
+        .compile("x = fold acc = 0 for v in [1] { break acc if 1\nreturn acc }\nreturn x")
+        .expect_err("break guards must be Boolean");
+    assert!(non_boolean.iter().any(|d| d.code == "RL2305"));
+}
+
+#[test]
+fn user_errors_cannot_forge_fold_break_control() {
+    let runtime = Runtime::builder().build().unwrap();
+    let source = "x = fold acc = 0 for v in [1] {\n  \
+                  return fail(\"RL4108\", \"real failure\", { __runlet_break_value: 99 })\n}\nreturn x";
+    let error = runtime
+        .run(&runtime.compile(source).unwrap())
+        .expect_err("a user error must not become a successful break");
+    assert_eq!(error.code, "RL4108");
+}
+
+#[test]
+fn fold_break_value_must_match_the_accumulator_schema() {
+    let runtime = Runtime::builder().build().unwrap();
+    let diagnostics = runtime
+        .compile(
+            "x = fold acc = 0 for v in [1] { break \"wrong\" if v == 1\nreturn acc }\nreturn x",
+        )
+        .expect_err("break value must preserve the accumulator schema");
+    assert!(diagnostics.iter().any(|d| d.code == "RL2313"));
+
+    for source in [
+        "x = fold acc = \"\" for v in [1] { break 1 if v == 1\nreturn acc }\nreturn x",
+        "x = fold acc = 0 for v in [1] { break (\"wrong\" if true else null)\nreturn acc }\nreturn x",
+        "x = fold acc = 0 for v in [1] { break (v if false else \"wrong\")\nreturn acc }\nreturn x",
+        "x = fold acc = null for v in [1] { break (v if false else \"wrong\")\nreturn acc }\nreturn x",
+        "x = fold acc = [0] for v in [1] { break [\"wrong\"]\nreturn acc }\nreturn x",
+        "x = fold acc = { fixed: 0 } for v in [1] { break { [v]: \"wrong\" }\nreturn acc }\nreturn x",
+        "x = fold acc = 0 for v in [1] { break json.parse(\"{}\")\nreturn acc }\nreturn x",
+        "x = fold acc = [0] for v in [1] { break [json.parse(\"\\\"wrong\\\"\")]\nreturn acc }\nreturn x",
+    ] {
+        let formatting = runtime
+            .compile(source)
+            .expect_err("formatting conversions must not change the accumulator schema");
+        assert!(formatting.iter().any(|d| d.code == "RL2313"));
+    }
+
+    let missing = runtime
+        .compile(
+            "x = fold acc = 0 for v in [1] { break acc.missing if true\nreturn acc }\nreturn x",
+        )
+        .expect_err("an invalid break expression must retain its diagnostic");
+    assert!(missing.iter().any(|d| d.code == "RL2103"));
+}
+
+#[test]
+fn fold_break_accepts_an_unchanged_any_accumulator() {
+    let runtime = Runtime::builder().with_prelude().build().unwrap();
+    let source = "seed = json.parse(\"0\")\nx = fold acc = seed for v in [1] { break acc\nreturn acc }\nreturn x";
+    let execution = runtime.run(&runtime.compile(source).unwrap()).unwrap();
+    assert_eq!(execution.value, CanonicalValue::Integer(0));
+}
+
+#[test]
+fn fold_break_widens_beside_an_unchanged_any_field() {
+    let runtime = Runtime::builder().with_prelude().build().unwrap();
+    let source = "
+seed = { hit: null, payload: json.parse(\"0\") }
+result = fold state = seed for item in [1] {
+    break { hit: item, payload: state.payload }
+    return state
+}
+return result.hit if result.hit != null else 0
+";
+    let execution = runtime.run(&runtime.compile(source).unwrap()).unwrap();
+    assert_eq!(execution.value, CanonicalValue::Integer(1));
+}
+
+#[test]
+fn fold_break_accepts_a_closed_object_for_a_map_accumulator() {
+    let runtime = Runtime::builder().build().unwrap();
+    let source = "x = fold acc = {} for v in [1] {\n  \
+                  break { done: 1 }\n  return acc + { [v]: v }\n}\nreturn x.done";
+    let execution = runtime.run(&runtime.compile(source).unwrap()).unwrap();
+    assert_eq!(execution.value, CanonicalValue::Integer(1));
+}
+
+#[test]
+fn null_seed_break_schema_join_is_source_order_independent() {
+    let runtime = Runtime::builder().build().unwrap();
+    for statements in [
+        "break { fixed: v } if false\n  break { [v]: v } if true",
+        "break { [v]: v } if true\n  break { fixed: v } if false",
+    ] {
+        let source = format!(
+            "x = fold acc = null for v in [1] {{\n  {statements}\n  return null\n}}\nreturn x"
+        );
+        let execution = runtime.run(&runtime.compile(&source).unwrap()).unwrap();
+        assert_eq!(
+            execution.value,
+            CanonicalValue::Object(BTreeMap::from([("1".into(), CanonicalValue::Integer(1),)]))
+        );
+    }
+}
+
+#[test]
+fn break_is_rejected_outside_folds_and_across_boundaries() {
+    let runtime = Runtime::builder().build().unwrap();
+    for source in [
+        "break 1\nreturn 0",
+        "x = for v in [1] { break v\nreturn v }\nreturn x",
+        "x = fold acc = 0 for v in [1] {\n  y = boundary { break acc\nreturn 1 } catch err { return 0 }\n  return y\n}\nreturn x",
+        "x = fold acc = 0 for v in [1] {\n  y = if true { break acc\nreturn 1 } else { return 0 }\n  return y\n}\nreturn x",
+        "x = fold acc = 0 for v in [1] {\n  y = after true { break acc\nreturn 1 }\n  return y\n}\nreturn x",
+    ] {
+        let diagnostics = runtime
+            .compile(source)
+            .expect_err("break placement must fail");
+        assert_eq!(diagnostics[0].code, "RL1020", "{source}");
+    }
+}
+
+#[test]
+fn fold_break_can_supply_structural_object_widening() {
+    let runtime = Runtime::builder().build().unwrap();
+    let source = "
+users = [{ name: \"a\", admin: false }, { name: \"b\", admin: true }]
+found = fold state = { hit: null } for user in users {
+    break { hit: user } if user.admin
+    return state
+}
+return found.hit.name if found.hit != null else \"none\"
+";
+    let execution = runtime.run(&runtime.compile(source).unwrap()).unwrap();
+    assert_eq!(execution.value, CanonicalValue::String("b".into()));
+}
+
+#[test]
+fn fold_break_widens_a_null_seed_for_find_first() {
+    let runtime = Runtime::builder().build().unwrap();
+    let source = "
+users = [{ name: \"a\", admin: false }, { name: \"b\", admin: true }]
+found = fold hit = null for user in users {
+    break user if user.admin
+    return hit
+}
+return found.name if found != null else \"none\"
+";
+    let execution = runtime.run(&runtime.compile(source).unwrap()).unwrap();
+    assert_eq!(execution.value, CanonicalValue::String("b".into()));
+}
+
+#[test]
 fn fold_over_empty_collection_yields_the_initial_value() {
     let runtime = Runtime::builder().build().unwrap();
     let source = "empty = []\nreturn fold acc = 42 for x in empty { return acc + 1 }";
@@ -1171,6 +1353,37 @@ fn fold_chains_dependent_tool_calls_in_order() {
     let execution = runtime.run(&program).unwrap();
     assert_eq!(execution.value, CanonicalValue::Integer(30));
     assert_eq!(*seen.lock().unwrap(), vec![0, 10, 20]);
+}
+
+#[test]
+fn fold_break_makes_accumulator_independent_effects_legitimately_sequential() {
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(effect_descriptor("service.poll", vec![], Schema::INTEGER))
+        .unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let runtime = Runtime::builder()
+        .registry(registry)
+        .tool("service.poll", {
+            let calls = calls.clone();
+            move |_, _| {
+                let attempt = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                Ok(CanonicalValue::Integer(attempt as i64))
+            }
+        })
+        .build()
+        .unwrap();
+    let source = "last = fold acc = 0 for attempt in [1, 2, 3, 4, 5] {\n  \
+                  result = service.poll()\n  break result if result == 3\n  return result\n}\nreturn last";
+    let program = runtime.compile(source).unwrap();
+    assert!(
+        !program.diagnostics.iter().any(|d| d.code == "RL1206"),
+        "break makes the fold intentionally sequential: {:?}",
+        program.diagnostics
+    );
+    let execution = runtime.run(&program).unwrap();
+    assert_eq!(execution.value, CanonicalValue::Integer(3));
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
 }
 
 #[test]

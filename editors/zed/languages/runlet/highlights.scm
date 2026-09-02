@@ -18,6 +18,7 @@
   "else"
   "fold"
   "skip"
+  "break"
   "assert"
   "fail"
 ] @keyword

@@ -131,7 +131,8 @@ The main rules are deliberately compact:
   concurrency; `skip if
   condition` drops an element.
 - `fold acc = init for item in items { ... }` reduces sequentially; the
-  body's `return` becomes the next accumulator.
+  body's `return` becomes the next accumulator, while
+  `break value if condition` stops early with a final accumulator.
 - Independent implicit effect and discard roots run concurrently. `after prerequisite { ...
   return value }` gates calls lexically created in its block (including nested
   branch/loop calls) without retroactively gating calls declared outside it.
