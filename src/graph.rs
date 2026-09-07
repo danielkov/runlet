@@ -39,9 +39,9 @@ pub enum NodeState {
     Blocked,
     /// Eligible to start.
     Ready,
-    /// Being handed to a tool implementation.
+    /// Inputs resolved; waiting for dispatch capacity (not executing).
     Dispatching,
-    /// Actively executing.
+    /// Active evaluation scope; for calls, permit held just before handler invocation.
     Running,
     /// Completed with a value.
     Succeeded,
@@ -95,7 +95,7 @@ pub enum EdgeKind {
     Contains,
     /// The source must complete before the destination.
     Orders,
-    /// The destination is another attempt of the source operation.
+    /// The source is a new attempt of the destination operation.
     RetryOf,
     /// The destination handles failure of the source.
     FallbackOf,
@@ -149,6 +149,7 @@ impl Graph {
         label: impl Into<String>,
         span: Span,
         attempt: u32,
+        state: NodeState,
     ) -> usize {
         let i = self.nodes.len();
         self.nodes.push(Node {
@@ -156,7 +157,7 @@ impl Graph {
             kind,
             label: label.into(),
             span,
-            state: NodeState::Ready,
+            state,
             attempt,
             output: None,
             error: None,

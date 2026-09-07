@@ -27,6 +27,7 @@ mod heal;
 mod lexer;
 mod parser;
 mod prelude;
+mod progress;
 mod runtime;
 mod schema;
 mod syntax;
@@ -37,6 +38,10 @@ pub use diagnostic::{Diagnostic, Fix, Phase, Severity, Span};
 pub use graph::{Edge, EdgeKind, Graph, GraphChange, GraphEvent, Node, NodeKind, NodeState};
 pub use heal::{Healed, heal};
 pub use parser::parse;
+pub use progress::{
+    ProgressChange, ProgressEdge, ProgressEdgeKind, ProgressEvent, ProgressNode, ProgressOutcome,
+    ProgressReceiver, ProgressRecvError, ProgressSender, ProgressState, progress_channel,
+};
 pub use runtime::{Execution, Runtime, RuntimeBuilder, ToolContext, ToolError};
 pub use schema::{CallSchema, ExecutionPolicy, Property, Schema, ToolDescriptor, ToolRegistry};
 pub use syntax::{BinaryOp, Block, Expr, ExprKind, ObjectKey, Program, Stmt, StmtKind, UnaryOp};

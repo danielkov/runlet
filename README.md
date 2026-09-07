@@ -201,6 +201,72 @@ deterministic intrinsics from [`STDLIB.md`](STDLIB.md) (host registrations of
 the same names win), and `.retry_backoff(base, factor, cap)` configures
 exponential backoff between boundary retry attempts.
 
+### Source-attributed progress
+
+`Runtime::run_with_progress(&program, sender)` accepts the one-shot sender from
+`progress_channel(capacity)`. Drain the receiver concurrently with `recv()`, or
+poll `try_recv()` from a host event loop. The bounded queue never waits for the
+consumer; a slow, dropped, or panicking consumer does not stop execution.
+
+```rust
+use runlet::{progress_channel, ProgressRecvError, Runtime};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let runtime = Runtime::builder().with_prelude().build()?;
+    let source = r#"return text.upper("hello")"#;
+    let program = runtime.compile(source).expect("valid source");
+    let (sender, mut progress) = progress_channel(256);
+    let _execution = std::thread::scope(|scope| {
+        let run = scope.spawn(|| runtime.run_with_progress(&program, sender));
+        loop {
+            match progress.recv() {
+                Ok(event) => println!("{event:?}"), // metadata only
+                Err(ProgressRecvError::Closed) => break,
+                Err(error) => {
+                    eprintln!("observation incomplete: {error}");
+                    break; // execution still continues
+                }
+            }
+        }
+        run.join().expect("executor did not panic")
+    })?;
+    Ok(())
+}
+```
+
+The typed stream contains node IDs, exact source byte spans, node kinds/states,
+retry attempts, value-free relationships, sequence numbers starting at 1, and a
+terminal run outcome. It excludes labels, tool names, inputs, outputs, error text,
+condition/path strings, and argument-derived operation/dispatch identities.
+`ToolContext.node_id` joins a real handler dispatch to its progress node; keep
+`operation_id` (logical operation) distinct from `dispatch_id` (actual attempt).
+Cached operations emit success without dispatch/waiting/running events.
+
+**Identity is run-local.** Namespace IDs with the host compose call **and execution
+incarnation**, and retain the exact compiled source. Identical spans can have
+many dynamic nodes across loop iterations and retries. `Contains` edges identify
+iteration ownership; `RetryOf` points from the new node to the previous attempt.
+Do not infer running state from descendants. For calls, `WaitingForCapacity`
+means resolved inputs awaiting a permit, while `Running` is emitted after permit
+acquisition immediately before handler invocation (including intrinsics). Capacity
+is released only after the call's terminal state is published. For
+structural/computation nodes, `Running` only means an active evaluation scope.
+`Blocked` does not name a blocker; provenance edges are not current wait reasons.
+Unobserved source expressions remain unknown, not implicitly pruned or blocked.
+
+**Loss is explicit.** After overflow the queued contiguous prefix drains, then
+`Lagged` is returned; publication never resumes. There is no replay or live
+resynchronization API. `Incomplete` means the publisher closed without a terminal
+event, such as on unwind. Only receipt of `Finished` establishes normal run
+completion (`Closed` follows it); `Failed` also covers registry rejection.
+Compilation errors happen before execution and produce no progress. A terminal
+run failure does not invent terminal states for unfinished nodes. Capacity must
+be positive and bounds queued metadata, not the existing execution graph.
+
+`run`, `run_observed`, and execution graph snapshots remain available. The legacy
+`run_observed` callback contains values and executes under the graph lock; it must
+not block, reenter, or panic. Use the bounded stream for isolated host progress.
+
 ## Enriching an AgentKit runtime
 
 [AgentKit](https://github.com/danielkov/agentkit) provides the surrounding
