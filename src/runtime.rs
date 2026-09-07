@@ -1,4 +1,5 @@
 use crate::analyzer::{CompiledProgram, ExternalInput, compile};
+use crate::progress::{ProgressChange, ProgressEvent, ProgressOutcome, ProgressSender};
 use crate::{
     BinaryOp, Block, CanonicalValue as V, Diagnostic, Expr, ExprKind, Graph, GraphChange,
     GraphEvent, NodeKind, NodeState, Schema, Span, ToolRegistry, UnaryOp,
@@ -12,13 +13,15 @@ use thiserror::Error;
 #[derive(Debug, Clone)]
 /// Metadata supplied to a host tool handler for one dispatch attempt.
 pub struct ToolContext {
-    /// Execution graph node associated with this dispatch.
+    /// Run-local execution graph node associated with this dispatch. Joins to
+    /// [`crate::ProgressNode::id`]; hosts must namespace it by call and run.
     pub node_id: String,
     /// Stable identity shared by retries of the same logical operation.
     pub operation_id: String,
-    /// Identity unique to this individual dispatch attempt.
+    /// Identity unique to this individual dispatch attempt within the run.
+    /// Cached operations do not invoke a handler or allocate a dispatch ID.
     pub dispatch_id: String,
-    /// Zero-based retry attempt.
+    /// Zero-based enclosing boundary retry attempt, not the dispatch generation.
     pub attempt: u32,
     /// Version declared by the tool descriptor.
     pub schema_version: String,
@@ -174,12 +177,15 @@ impl Runtime {
     ///
     /// The program must have been compiled against an equivalent registry.
     pub fn run(&self, program: &CompiledProgram) -> Result<Execution, ToolError> {
-        self.run_observed(program, |_| {})
+        self.run_inner(program, Arc::new(LiveGraph::new(Observation::None)))
     }
 
     /// Runs a program and reports graph changes from executor threads as they happen.
     ///
     /// Calls to `observer` are serialized and sequence numbers are strictly increasing.
+    /// This legacy, payload-bearing callback runs under the graph lock: it must
+    /// not block, reenter or panic. For isolated, bounded, value-free observation,
+    /// prefer [`Self::run_with_progress`].
     pub fn run_observed<F>(
         &self,
         program: &CompiledProgram,
@@ -188,13 +194,43 @@ impl Runtime {
     where
         F: Fn(&GraphEvent) + Send + Sync + 'static,
     {
+        self.run_inner(
+            program,
+            Arc::new(LiveGraph::new(Observation::Legacy(Arc::new(observer)))),
+        )
+    }
+
+    /// Executes with a one-shot bounded metadata publisher. Consume its receiver
+    /// concurrently; overflow or consumer drop does not affect execution. A
+    /// normal return emits `Finished` (including registry rejection); unwind
+    /// closes without it. See [`crate::progress_channel`] for gap semantics and
+    /// [`crate::ProgressNode`] for run-local source attribution.
+    pub fn run_with_progress(
+        &self,
+        program: &CompiledProgram,
+        progress: ProgressSender,
+    ) -> Result<Execution, ToolError> {
+        let graph = Arc::new(LiveGraph::new(Observation::Progress(progress)));
+        let result = self.run_inner(program, graph.clone());
+        graph.finished(if result.is_ok() {
+            ProgressOutcome::Succeeded
+        } else {
+            ProgressOutcome::Failed
+        });
+        result
+    }
+
+    fn run_inner(
+        &self,
+        program: &CompiledProgram,
+        graph: Arc<LiveGraph>,
+    ) -> Result<Execution, ToolError> {
         if program.registry_digest != self.registry.digest() {
             return Err(ToolError::new(
                 "RL7102",
                 "compiled program registry digest does not match this runtime",
             ));
         }
-        let graph = Arc::new(LiveGraph::new(Arc::new(observer)));
         let mut ev = Evaluator {
             runtime: self,
             graph: graph.clone(),
@@ -225,9 +261,13 @@ impl Runtime {
             }
         }
         ev.scopes.push(root);
-        let node = ev
-            .graph
-            .begin(NodeKind::Root, "return", program.program.result.span, 0);
+        let node = ev.graph.begin(
+            NodeKind::Root,
+            "return",
+            program.program.result.span,
+            0,
+            NodeState::Ready,
+        );
         ev.graph.running(node);
         let outcome = ev.block_contents(&program.program.statements, &program.program.result);
         match outcome {
@@ -443,34 +483,74 @@ struct Evaluator<'a> {
 
 struct LiveGraph {
     state: Mutex<LiveGraphState>,
-    observer: Arc<dyn Fn(&GraphEvent) + Send + Sync>,
 }
 
 #[derive(Default)]
 struct LiveGraphState {
     graph: Graph,
     sequence: u64,
+    observation: Observation,
+}
+
+#[derive(Default)]
+enum Observation {
+    #[default]
+    None,
+    Legacy(Arc<dyn Fn(&GraphEvent) + Send + Sync>),
+    Progress(ProgressSender),
 }
 
 impl LiveGraph {
-    fn new(observer: Arc<dyn Fn(&GraphEvent) + Send + Sync>) -> Self {
+    fn new(observation: Observation) -> Self {
         Self {
-            state: Mutex::new(LiveGraphState::default()),
-            observer,
+            state: Mutex::new(LiveGraphState {
+                observation,
+                ..LiveGraphState::default()
+            }),
         }
     }
 
+    // The graph mutex linearizes metadata and sequence. Progress publication
+    // is nonblocking and contains only library-owned metadata: no host code,
+    // host destructors, or secondary runtime lock acquisitions. Legacy callback
+    // behavior is intentionally retained separately for API compatibility.
     fn publish(&self, state: &mut LiveGraphState, change: GraphChange) {
         state.sequence += 1;
-        (self.observer)(&GraphEvent {
-            sequence: state.sequence,
-            change,
-        });
+        match &mut state.observation {
+            Observation::None => {}
+            Observation::Legacy(observer) => observer(&GraphEvent {
+                sequence: state.sequence,
+                change,
+            }),
+            Observation::Progress(sender) => sender.send(ProgressEvent {
+                sequence: state.sequence,
+                change: (&change).into(),
+            }),
+        }
     }
 
-    fn begin(&self, kind: NodeKind, label: impl Into<String>, span: Span, attempt: u32) -> usize {
+    fn finished(&self, outcome: ProgressOutcome) {
         let mut state = self.state.lock().unwrap();
-        let index = state.graph.begin(kind, label, span, attempt);
+        state.sequence += 1;
+        let sequence = state.sequence;
+        if let Observation::Progress(sender) = &mut state.observation {
+            sender.send(ProgressEvent {
+                sequence,
+                change: ProgressChange::Finished(outcome),
+            });
+        }
+    }
+
+    fn begin(
+        &self,
+        kind: NodeKind,
+        label: impl Into<String>,
+        span: Span,
+        attempt: u32,
+        initial: NodeState,
+    ) -> usize {
+        let mut state = self.state.lock().unwrap();
+        let index = state.graph.begin(kind, label, span, attempt, initial);
         let node = state.graph.nodes[index].clone();
         self.publish(&mut state, GraphChange::NodeAdded(node));
         index
@@ -495,12 +575,6 @@ impl LiveGraph {
 
     fn label(&self, index: usize, label: String) {
         self.update(index, |graph, index| graph.nodes[index].label = label);
-    }
-
-    fn blocked(&self, index: usize) {
-        self.update(index, |graph, index| {
-            graph.nodes[index].state = NodeState::Blocked
-        });
     }
 
     fn success(&self, index: usize, value: V) {
@@ -1073,7 +1147,6 @@ impl Evaluator<'_> {
             let display = display.chars().take(80).collect::<String>();
             self.graph.label(node, format!("{name} · {display}"));
         }
-        self.graph.dispatching(node);
         let canonical = V::List(values.clone())
             .rcve()
             .map_err(|x| lang("RL5207", &x.to_string()))?;
@@ -1086,12 +1159,14 @@ impl Evaluator<'_> {
             self.dynamic.join("/")
         );
         let op = hex::encode(Sha256::digest([identity.as_bytes(), &canonical].concat()));
-        if let Some(previous_attempt) = self
+        // Release the registry guard before graph publication (legacy observers
+        // are arbitrary callbacks, and must not also own this registry).
+        let previous_attempt = self
             .operation_nodes
             .lock()
             .unwrap()
-            .insert(op.clone(), node)
-        {
+            .insert(op.clone(), node);
+        if let Some(previous_attempt) = previous_attempt {
             self.graph.retry_of(node, previous_attempt);
         }
         let previous = self.successful_operations.lock().unwrap().get(&op).cloned();
@@ -1112,7 +1187,6 @@ impl Evaluator<'_> {
             attempt: self.attempt,
             schema_version: desc.schema_version.clone(),
         };
-        self.graph.running(node);
         let handler = self
             .runtime
             .handlers
@@ -1120,7 +1194,9 @@ impl Evaluator<'_> {
             .ok_or_else(|| lang("RL8103", "missing tool implementation"))?;
         // Leaf-only permit: bounds active dispatches without nesting deadlock.
         let dispatches = self.dispatches.clone();
+        self.graph.dispatching(node);
         let permit = dispatches.acquire();
+        self.graph.running(node);
         let mut r = handler(&values, &ctx).and_then(|v| {
             if desc.output.accepts(&v) {
                 Ok(v)
@@ -1128,7 +1204,6 @@ impl Evaluator<'_> {
                 Err(lang("RL6103", "TOOL_OUTPUT_SCHEMA_MISMATCH"))
             }
         });
-        drop(permit);
         if let Err(error) = &mut r {
             error.retryable &= matches!(
                 desc.execution,
@@ -1143,7 +1218,11 @@ impl Evaluator<'_> {
                 .unwrap()
                 .insert(op, value.clone());
         }
-        self.finish(node, r)
+        // Keep capacity reserved until the terminal state is published, so
+        // observed Running intervals cannot exceed the dispatch limit.
+        let result = self.finish(node, r);
+        drop(permit);
+        result
     }
     fn binary(
         &mut self,
@@ -1357,6 +1436,7 @@ impl Evaluator<'_> {
             format!("boundary retry {retries}"),
             span,
         )?;
+        let enclosing_attempt = self.attempt;
         let mut last = None;
         for attempt in 0..=retries {
             self.attempt = attempt;
@@ -1365,7 +1445,7 @@ impl Evaluator<'_> {
             self.owners.pop();
             match r {
                 Ok(v) => {
-                    self.attempt = 0;
+                    self.attempt = enclosing_attempt;
                     return self.finish(node, Ok(v));
                 }
                 Err(e) => {
@@ -1395,7 +1475,7 @@ impl Evaluator<'_> {
         let r = self.block(catch);
         self.owners.pop();
         self.scopes.pop();
-        self.attempt = 0;
+        self.attempt = enclosing_attempt;
         self.finish(node, r)
     }
     fn block(&mut self, b: &Block) -> Result<V, ToolError> {
@@ -1676,7 +1756,7 @@ impl Evaluator<'_> {
     }
     fn node(&mut self, k: NodeKind, l: impl Into<String>, s: Span) -> Result<usize, ToolError> {
         self.budget()?;
-        let i = self.graph.begin(k, l, s, self.attempt);
+        let i = self.graph.begin(k, l, s, self.attempt, NodeState::Ready);
         self.graph.running(i);
         if let Some(&p) = self.owners.last() {
             self.graph.contains(p, i)
@@ -1690,8 +1770,7 @@ impl Evaluator<'_> {
         s: Span,
     ) -> Result<usize, ToolError> {
         self.budget()?;
-        let i = self.graph.begin(k, l, s, self.attempt);
-        self.graph.blocked(i);
+        let i = self.graph.begin(k, l, s, self.attempt, NodeState::Blocked);
         if let Some(&parent) = self.owners.last() {
             self.graph.contains(parent, i)
         }
