@@ -1,0 +1,7 @@
+#! expect: { "text": "ADA,BO,CY", "length": 3, "number": 6 }
+data = data.users()
+list = for u in data { return text.upper(u.name) }
+text = text.join(list, ",")
+length = list.length(list)
+number = fold number = 0 for user in data { return number + user.id }
+return { text, length, number }

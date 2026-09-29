@@ -205,7 +205,7 @@ impl Lexer<'_> {
                 self.push(TokenKind::GreaterEqual, start);
             }
             '>' => self.push(TokenKind::Greater, start),
-            '"' => self.string(start),
+            '"' | '\'' => self.string(start, ch),
             c if c.is_ascii_digit() => self.number(start),
             c if c == '_' || unicode_ident::is_xid_start(c) => self.ident(start),
             _ => self.diagnostics.push(
@@ -226,28 +226,33 @@ impl Lexer<'_> {
             self.bump();
         }
     }
-    fn string(&mut self, start: usize) {
+    fn string(&mut self, start: usize, quote: char) {
         let content_start = self.pos;
         let mut escaped = false;
         while let Some(c) = self.bump() {
-            if c == '"' && !escaped {
+            if c == quote && !escaped {
                 let raw = &self.source[content_start..self.pos - 1];
-                match serde_json::from_str::<String>(&format!("\"{raw}\"")) {
+                match unescape(raw) {
                     Ok(s) => self.push(TokenKind::String(s), start),
-                    Err(e) => self.diagnostics.push(
-                        Diagnostic::error(
+                    Err(invalid) => {
+                        let span =
+                            Span::new(content_start + invalid.start, content_start + invalid.end);
+                        let mut diagnostic = Diagnostic::error(
                             "RL1003",
                             Phase::Parse,
-                            Span::new(start, self.pos),
-                            "invalid string escape",
-                            e.to_string(),
-                        )
-                        .with_fix(
-                            Span::new(start, self.pos),
-                            "\"\"",
-                            "replace with a valid JSON string",
-                        ),
-                    ),
+                            span,
+                            invalid.title,
+                            invalid.message,
+                        );
+                        if let Some((replacement, message)) = invalid.fix {
+                            diagnostic = diagnostic.with_fix(
+                                Span::new(span.start, span.start + 1),
+                                replacement,
+                                message,
+                            );
+                        }
+                        self.diagnostics.push(diagnostic);
+                    }
                 }
                 return;
             }
@@ -351,4 +356,115 @@ impl Lexer<'_> {
         self.pos += c.len_utf8();
         Some(c)
     }
+}
+
+struct InvalidString {
+    start: usize,
+    end: usize,
+    title: &'static str,
+    message: String,
+    fix: Option<(String, &'static str)>,
+}
+
+/// Decodes string literal contents. Defined escapes follow JSON plus `\'`;
+/// any other backslash pair and raw line feeds, carriage returns, and tabs
+/// are kept verbatim.
+fn unescape(raw: &str) -> Result<String, InvalidString> {
+    let control = |at: usize, c: char| InvalidString {
+        start: at,
+        end: at + 1,
+        title: "invalid string character",
+        message: format!(
+            "raw control character U+{:04X} is not allowed in a string",
+            c as u32
+        ),
+        fix: Some((
+            format!("\\u{:04x}", c as u32),
+            "escape the control character",
+        )),
+    };
+    let allowed = |c: char| c >= ' ' || matches!(c, '\n' | '\r' | '\t');
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.char_indices().peekable();
+    while let Some((at, c)) = chars.next() {
+        if c != '\\' {
+            if !allowed(c) {
+                return Err(control(at, c));
+            }
+            out.push(c);
+            continue;
+        }
+        let Some((e_at, e)) = chars.next() else {
+            out.push('\\');
+            break;
+        };
+        let end = e_at + e.len_utf8();
+        let decoded = match e {
+            '"' => '"',
+            '\'' => '\'',
+            '\\' => '\\',
+            '/' => '/',
+            'b' => '\u{8}',
+            'f' => '\u{c}',
+            'n' => '\n',
+            'r' => '\r',
+            't' => '\t',
+            'u' => {
+                let Some(high) = hex4(raw, end) else {
+                    return Err(InvalidString {
+                        start: at,
+                        end,
+                        title: "invalid string escape",
+                        message: "`\\u` must be followed by exactly four hex digits".to_owned(),
+                        fix: Some((
+                            "\\\\".to_owned(),
+                            "escape the backslash to keep it literally",
+                        )),
+                    });
+                };
+                let mut end = end + 4;
+                let code = match high {
+                    0xD800..=0xDBFF => match raw[end..]
+                        .strip_prefix("\\u")
+                        .and_then(|_| hex4(raw, end + 2))
+                    {
+                        Some(low @ 0xDC00..=0xDFFF) => {
+                            end += 6;
+                            0x10000 + ((high - 0xD800) << 10) + (low - 0xDC00)
+                        }
+                        _ => high,
+                    },
+                    _ => high,
+                };
+                let Some(decoded) = char::from_u32(code) else {
+                    return Err(InvalidString {
+                        start: at,
+                        end,
+                        title: "invalid string escape",
+                        message: format!("`{}` is a lone UTF-16 surrogate", &raw[at..end]),
+                        fix: None,
+                    });
+                };
+                while chars.peek().is_some_and(|&(i, _)| i < end) {
+                    chars.next();
+                }
+                decoded
+            }
+            _ if !allowed(e) => return Err(control(e_at, e)),
+            _ => {
+                out.push('\\');
+                e
+            }
+        };
+        out.push(decoded);
+    }
+    Ok(out)
+}
+
+fn hex4(raw: &str, at: usize) -> Option<u32> {
+    let digits = raw.get(at..at + 4)?;
+    if !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    u32::from_str_radix(digits, 16).ok()
 }

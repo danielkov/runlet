@@ -43,7 +43,6 @@ pub fn compile(
         diagnostics: vec![],
         scopes: vec![],
         break_schemas: vec![],
-        registry_roots: registry.roots().into_iter().map(str::to_owned).collect(),
     };
     let mut root = BTreeMap::new();
     for i in inputs {
@@ -78,7 +77,6 @@ struct Analyzer<'a> {
     /// Break values collected for the fold body currently being analyzed.
     /// Nested folds push their own collector so breaks never escape outward.
     break_schemas: Vec<Vec<(Span, Schema)>>,
-    registry_roots: BTreeSet<String>,
 }
 impl Analyzer<'_> {
     fn analyze_program(&mut self, p: &Program) {
@@ -133,22 +131,6 @@ impl Analyzer<'_> {
                     continue;
                 }
             };
-            if self.registry_roots.contains(name) {
-                self.diagnostics.push(
-                    Diagnostic::error(
-                        "RL2107",
-                        Phase::Analyze,
-                        s.span,
-                        "binding collides with registry root",
-                        format!("`{name}` is a registered namespace root"),
-                    )
-                    .with_fix(
-                        Span::new(s.span.start, s.span.start + name.len()),
-                        format!("{name}_value"),
-                        "rename the binding",
-                    ),
-                );
-            }
             if defs.insert(name.clone(), value).is_some() || self.scopes[scope].contains_key(name) {
                 self.diagnostics.push(
                     Diagnostic::error(
@@ -266,6 +248,9 @@ impl Analyzer<'_> {
             }
             ExprKind::String(_) => Schema::string(),
             ExprKind::Name(n) => self.lookup(n).unwrap_or_else(|| {
+                if self.callable_as_value(n, e.span) {
+                    return Schema::Any;
+                }
                 let c = closest(n, self.visible_names());
                 self.diagnostics.push(
                     Diagnostic::error(
@@ -273,7 +258,7 @@ impl Analyzer<'_> {
                         Phase::Analyze,
                         e.span,
                         "unknown name",
-                        format!("`{n}` is not a local, host input, or registered callable"),
+                        format!("`{n}` is not a local or host input"),
                     )
                     .with_candidates(c),
                 );
@@ -327,11 +312,14 @@ impl Analyzer<'_> {
                 }
             }
             ExprKind::Member { target, field } => {
-                if let Some(path) = path_of(e) {
-                    let prefix = path + ".";
-                    if self.registry.names().any(|n| n.starts_with(&prefix)) {
-                        return Schema::Any;
-                    }
+                // Bindings and callables live in separate namespaces: a
+                // registry path outside callee position is only an error
+                // when its root is not a local.
+                if let Some(path) = path_of(e)
+                    && self.lookup(root_of(&path)).is_none()
+                    && self.callable_as_value(&path, e.span)
+                {
+                    return Schema::Any;
                 }
                 let t = self.expr(target);
                 project_schema(&t, field).unwrap_or_else(|| {
@@ -730,11 +718,31 @@ impl Analyzer<'_> {
         self.scopes.iter().rev().find_map(|s| s.get(n).cloned())
     }
     fn visible_names(&self) -> Vec<String> {
-        self.scopes
-            .iter()
-            .flat_map(|s| s.keys().cloned())
-            .chain(self.registry.names().map(str::to_owned))
-            .collect()
+        self.scopes.iter().flat_map(|s| s.keys().cloned()).collect()
+    }
+    /// Reports a registered callable or namespace path used where a value
+    /// is expected. Callables are not values, so they resolve only in
+    /// callee position; returns whether a diagnostic was pushed.
+    fn callable_as_value(&mut self, path: &str, span: Span) -> bool {
+        let prefix = format!("{path}.");
+        let message = if self.registry.get(path).is_some() {
+            format!("`{path}` is a registered callable, not a value; call it: `{path}(...)`")
+        } else if let Some(tool) = self.registry.names().find(|n| n.starts_with(&prefix)) {
+            format!(
+                "`{path}` is a callable namespace, not a value; call one of its tools, \
+                 e.g. `{tool}(...)`"
+            )
+        } else {
+            return false;
+        };
+        self.diagnostics.push(Diagnostic::error(
+            "RL2104",
+            Phase::Analyze,
+            span,
+            "callable used as a value",
+            message,
+        ));
+        true
     }
     fn err(&mut self, code: &str, span: Span, msg: &str) {
         self.diagnostics.push(
@@ -766,6 +774,9 @@ fn string_context(s: &Schema) -> bool {
     }
 }
 
+fn root_of(path: &str) -> &str {
+    path.split('.').next().unwrap_or(path)
+}
 fn path_of(e: &Expr) -> Option<String> {
     match &e.kind {
         ExprKind::Name(n) => Some(n.clone()),
