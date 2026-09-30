@@ -1045,13 +1045,149 @@ fn parser_error_recovery_always_makes_progress() {
 
 #[test]
 fn lexical_errors_stop_before_string_contents_become_diagnostics() {
-    // Distilled from a generated shell command. `\(` is not a JSON string
-    // escape and the following quote is syntactically the end of the Runlet
-    // string. Shell punctuation after it must not be reported as Runlet errors.
-    let source = r#"return shell({ command: "rg -n \"session::open|\bopen\(" src | head" })"#;
+    // A malformed `\u` escape stops lexing; shell punctuation after the
+    // string must not be reported as Runlet errors.
+    let source = r#"return shell({ command: "rg -n \"open\u12(" src | head" })"#;
     let diagnostics = parse(source).unwrap_err();
     assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
     assert_eq!(diagnostics[0].code, "RL1003", "{diagnostics:#?}");
+}
+
+fn eval_string(source: &str) -> CanonicalValue {
+    let runtime = Runtime::builder().build().unwrap();
+    runtime
+        .run(&runtime.compile(source).unwrap())
+        .unwrap()
+        .value
+}
+
+fn line_of(source: &str, offset: usize) -> usize {
+    source[..offset].matches('\n').count() + 1
+}
+
+#[test]
+fn string_literals_keep_raw_line_feeds_carriage_returns_and_tabs() {
+    assert_eq!(
+        eval_string("return \"cat > a.py <<'PY'\nimport os\nPY\""),
+        CanonicalValue::String("cat > a.py <<'PY'\nimport os\nPY".into())
+    );
+    assert_eq!(
+        eval_string("return \"one\r\ntwo\r\n\""),
+        CanonicalValue::String("one\r\ntwo\r\n".into())
+    );
+    assert_eq!(
+        eval_string("return \"a\tb\""),
+        CanonicalValue::String("a\tb".into())
+    );
+}
+
+#[test]
+fn string_literals_mix_raw_newlines_with_escapes() {
+    let source = "return \"line \\\"one\\\"\n\\ttab\\\\slash\\/\\u00e9\\ud83d\\ude00\\n\nend\"";
+    assert_eq!(
+        eval_string(source),
+        CanonicalValue::String("line \"one\"\n\ttab\\slash/\u{e9}\u{1f600}\n\nend".into())
+    );
+}
+
+#[test]
+fn diagnostics_after_multi_line_string_point_at_the_right_line() {
+    for source in [
+        "a = \"x\ny\r\nz\"\nb = 1 @ 2\nreturn b",
+        "a = 'x\ny\r\n\"z\"'\nb = 1 @ 2\nreturn b",
+    ] {
+        let diagnostics = parse(source).unwrap_err();
+        assert_eq!(diagnostics[0].code, "RL1001", "{diagnostics:#?}");
+        let at = diagnostics[0].primary_span.start;
+        assert_eq!(&source[at..at + 1], "@");
+        assert_eq!(line_of(source, at), 4);
+    }
+
+    let runtime = Runtime::builder().build().unwrap();
+    let source = "a = 'first\nsecond\nthird'\nreturn missing";
+    let diagnostics = runtime.compile(source).unwrap_err();
+    assert_eq!(diagnostics[0].code, "RL2101", "{diagnostics:#?}");
+    let span = diagnostics[0].primary_span;
+    assert_eq!(&source[span.start..span.end], "missing");
+    assert_eq!(line_of(source, span.start), 4);
+}
+
+#[test]
+fn single_quoted_string_literals() {
+    assert_eq!(
+        eval_string(r#"return '  "databse": {'"#),
+        CanonicalValue::String(r#"  "databse": {"#.into())
+    );
+    assert_eq!(
+        eval_string(r#"return 'it\'s \"q\" \n\t\u00e9 \\ \/'"#),
+        CanonicalValue::String("it's \"q\" \n\t\u{e9} \\ /".into())
+    );
+    assert_eq!(
+        eval_string("return 'one\r\ntwo\n\tthree'"),
+        CanonicalValue::String("one\r\ntwo\n\tthree".into())
+    );
+    assert_eq!(
+        eval_string(r#"return "it\'s""#),
+        CanonicalValue::String("it's".into())
+    );
+    assert_eq!(
+        eval_string(r#"return {old: '"a"', new: "'b'"}"#),
+        CanonicalValue::Object(BTreeMap::from([
+            ("new".into(), CanonicalValue::String("'b'".into())),
+            ("old".into(), CanonicalValue::String("\"a\"".into())),
+        ]))
+    );
+}
+
+#[test]
+fn unknown_escapes_are_kept_verbatim() {
+    assert_eq!(
+        eval_string(r#"return "find . \( -name x \) \1 \x00 \d \$ \.""#),
+        CanonicalValue::String(r"find . \( -name x \) \1 \x00 \d \$ \.".into())
+    );
+    assert_eq!(
+        eval_string(r"return '\x00 \d'"),
+        CanonicalValue::String(r"\x00 \d".into())
+    );
+    assert_eq!(
+        eval_string("return \"a\\\nb\""),
+        CanonicalValue::String("a\\\nb".into())
+    );
+    assert_eq!(
+        eval_string(r#"return "\"\'\\\/\b\f\n\r\t\u0041\ud83d\ude00""#),
+        CanonicalValue::String("\"'\\/\u{8}\u{c}\n\r\tA\u{1f600}".into())
+    );
+}
+
+#[test]
+fn malformed_defined_escapes_and_control_characters_still_error() {
+    for source in [r#"return "\u12G4""#, r"return '\u12'"] {
+        let diagnostics = parse(source).unwrap_err();
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+        let d = &diagnostics[0];
+        assert_eq!(d.code, "RL1003", "{d:#?}");
+        assert_eq!(&source[d.primary_span.start..d.primary_span.end], r"\u");
+        assert_eq!(&source[d.fixes[0].span.start..d.fixes[0].span.end], "\\");
+        assert_eq!(d.fixes[0].replacement, "\\\\");
+    }
+
+    for source in [
+        r#"return "\ud800""#,
+        r#"return "\udc00x""#,
+        r#"return '\ud800\u0041'"#,
+    ] {
+        let diagnostics = parse(source).unwrap_err();
+        assert_eq!(diagnostics[0].code, "RL1003", "{diagnostics:#?}");
+        assert!(diagnostics[0].fixes.is_empty());
+    }
+
+    for source in ["return \"a\u{1}b\"", "return 'a\\\u{1}b'"] {
+        let diagnostics = parse(source).unwrap_err();
+        let d = &diagnostics[0];
+        assert_eq!(d.code, "RL1003", "{d:#?}");
+        assert_eq!(d.fixes[0].replacement, "\\u0001");
+        assert_eq!(&source[d.fixes[0].span.start..d.fixes[0].span.end], "\u{1}");
+    }
 }
 
 #[test]
@@ -2587,4 +2723,88 @@ fn after_is_a_contextual_object_property_name() {
         execution.value,
         CanonicalValue::Object(BTreeMap::from([("after".into(), 1.into())]))
     );
+}
+
+#[test]
+fn bindings_may_share_names_with_callables() {
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(descriptor(
+            "count",
+            vec![Schema::list(Schema::Any)],
+            Schema::INTEGER,
+        ))
+        .unwrap();
+    registry
+        .register(descriptor(
+            "crm.customer",
+            vec![Schema::string()],
+            object(vec![("email", Schema::string())]),
+        ))
+        .unwrap();
+    let runtime = Runtime::builder()
+        .registry(registry)
+        .tool("count", |args, _| match &args[0] {
+            CanonicalValue::List(xs) => Ok((xs.len() as i64).into()),
+            _ => unreachable!(),
+        })
+        .tool("crm.customer", |_, _| Ok(VObj::one("email", "a@b.c")))
+        .build()
+        .unwrap();
+    // Callee position resolves against the registry, every other position
+    // against scopes, so a binding can reuse a tool or namespace name.
+    let source = "\
+count = count([1, 2, 3])
+crm = crm.customer(\"c1\")
+nested = for x in [1] {
+    count = count([x, x])
+    return count
+}
+return { count, email: crm.email, nested }";
+    let program = runtime
+        .compile(source)
+        .unwrap_or_else(|d| panic!("shadowing a callable must compile: {d:#?}"));
+    let execution = runtime.run(&program).unwrap();
+    assert_eq!(
+        execution.value,
+        CanonicalValue::Object(BTreeMap::from([
+            ("count".into(), 3.into()),
+            ("email".into(), "a@b.c".into()),
+            ("nested".into(), CanonicalValue::List(vec![2.into()])),
+        ]))
+    );
+    let calls = execution
+        .graph
+        .nodes
+        .iter()
+        .filter(|n| n.kind == NodeKind::Call)
+        .map(|n| n.label.split(" · ").next().unwrap())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(calls, BTreeSet::from(["count", "crm.customer"]));
+
+    // Projection on a local that shares a registry root is schema-checked.
+    let unknown = runtime
+        .compile("crm = crm.customer(\"c1\")\nreturn crm.phone")
+        .expect_err("projection on the local must be checked");
+    assert!(unknown.iter().any(|d| d.code == "RL2103"), "{unknown:#?}");
+}
+
+#[test]
+fn callables_are_not_values() {
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(descriptor("count", vec![], Schema::INTEGER))
+        .unwrap();
+    registry
+        .register(descriptor("crm.customer", vec![], Schema::Null))
+        .unwrap();
+    for source in ["return count", "return crm", "return crm.customer"] {
+        let diagnostics = compile(source, &registry, &[]).expect_err(source);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.code == "RL2104" && d.message.contains("(...)")),
+            "{source}: {diagnostics:#?}"
+        );
+    }
 }

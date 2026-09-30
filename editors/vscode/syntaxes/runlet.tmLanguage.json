@@ -29,22 +29,44 @@
       ]
     },
     "strings": {
-      "name": "string.quoted.double.runlet",
-      "begin": "\"",
-      "beginCaptures": {
-        "0": { "name": "punctuation.definition.string.begin.runlet" }
-      },
-      "end": "\"",
-      "endCaptures": {
-        "0": { "name": "punctuation.definition.string.end.runlet" }
-      },
+      "patterns": [
+        {
+          "name": "string.quoted.double.runlet",
+          "begin": "\"",
+          "beginCaptures": {
+            "0": { "name": "punctuation.definition.string.begin.runlet" }
+          },
+          "end": "\"",
+          "endCaptures": {
+            "0": { "name": "punctuation.definition.string.end.runlet" }
+          },
+          "patterns": [{ "include": "#string-escapes" }]
+        },
+        {
+          "name": "string.quoted.single.runlet",
+          "begin": "'",
+          "beginCaptures": {
+            "0": { "name": "punctuation.definition.string.begin.runlet" }
+          },
+          "end": "'",
+          "endCaptures": {
+            "0": { "name": "punctuation.definition.string.end.runlet" }
+          },
+          "patterns": [{ "include": "#string-escapes" }]
+        }
+      ]
+    },
+    "string-escapes": {
       "patterns": [
         {
           "name": "constant.character.escape.runlet",
-          "match": "\\\\(?:[\"\\\\/bfnrt]|u[0-9A-Fa-f]{4})"
+          "match": "\\\\(?:[\"'\\\\/bfnrt]|u[0-9A-Fa-f]{4})"
         },
         {
           "name": "invalid.illegal.escape.runlet",
+          "match": "\\\\u"
+        },
+        {
           "match": "\\\\."
         }
       ]

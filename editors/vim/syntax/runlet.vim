@@ -7,7 +7,8 @@ syntax case match
 syntax match runletComment /#.*$/ contains=@Spell
 syntax match runletComment /\/\/.*$/ contains=@Spell
 syntax region runletString start=/"/ skip=/\\./ end=/"/ contains=runletEscape
-syntax match runletEscape /\\\%(["\\\/bfnrt]\|u[0-9A-Fa-f]\{4}\)/ contained
+syntax region runletString start=/'/ skip=/\\./ end=/'/ contains=runletEscape
+syntax match runletEscape /\\\%(["'\\\/bfnrt]\|u[0-9A-Fa-f]\{4}\)/ contained
 syntax match runletNumber /\<\d\+\%([eE][+-]\=\d\+\)\>/
 syntax match runletNumber /\<\d\+\.\d\+\%([eE][+-]\=\d\+\)\=/
 
