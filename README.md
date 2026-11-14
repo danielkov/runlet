@@ -271,8 +271,9 @@ elsewhere, such as MCP servers or OpenAPI operations:
 ```rust
 use runlet::{CanonicalValue, Schema};
 
-// JSON Schema -> Runlet schema. Total and widening: whatever Runlet cannot
-// express (`not`, `pattern`, tuples, remote `$ref`s, ...) becomes `Any`.
+// JSON Schema -> Runlet schema. Total and widening: `allOf`, tuples, local
+// `$ref`s and combined keywords are lowered; what Runlet cannot express
+// (`not`, conditionals, remote or recursive `$ref`s) becomes `Any`.
 let input = Schema::from_json_schema(&serde_json::json!({
     "type": "object",
     "properties": { "query": { "type": "string" } },

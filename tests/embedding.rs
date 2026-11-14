@@ -107,29 +107,126 @@ fn json_schema_widens_what_it_cannot_express() {
     any(json!({ "not": { "type": "string" } }));
     any(json!({ "$ref": "https://example.com/schema.json" }));
     any(json!({ "$ref": "#/$defs/missing" }));
-    any(json!({ "allOf": [{ "type": "object" }, { "required": ["a"] }] }));
     any(json!({ "enum": ["a", { "b": 1 }] }));
 
-    // A recursive schema terminates and still accepts recursive values.
-    let tree = Schema::from_json_schema(&json!({
-        "$ref": "#/$defs/node",
-        "$defs": { "node": {
-            "type": "object",
-            "properties": { "children": { "type": "array", "items": { "$ref": "#/$defs/node" } } }
-        } }
-    }));
-    assert!(tree.accepts(&value(json!({ "children": [{ "children": [] }] }))));
-
-    // Structural keywords imply the type; tuples keep only the list shape.
+    // Structural keywords imply the type.
     assert_eq!(
         Schema::from_json_schema(&json!({ "properties": { "a": { "const": 1 } } })).type_notation(),
         "{ a?: int }"
     );
+}
+
+#[test]
+fn json_schema_recursion_is_cut_after_one_expansion() {
+    // Two recursive properties would unroll exponentially if expanded to a
+    // depth limit; the cycle must be cut instead.
+    let tree = Schema::from_json_schema(&json!({
+        "$ref": "#/$defs/node",
+        "$defs": { "node": {
+            "type": "object",
+            "properties": {
+                "value": { "type": "integer" },
+                "left": { "$ref": "#/$defs/node" },
+                "right": { "$ref": "#/$defs/node" },
+                "children": { "type": "array", "items": { "$ref": "#/$defs/node" } }
+            },
+            "required": ["value"]
+        } }
+    }));
     assert_eq!(
-        Schema::from_json_schema(
-            &json!({ "type": "array", "prefixItems": [{ "type": "string" }] })
+        tree.type_notation(),
+        "{ children?: any[], left?: any, right?: any, value: int }"
+    );
+    assert!(tree.accepts(&value(json!({
+        "value": 1,
+        "left": { "value": 2, "children": [{ "value": 3, "right": { "value": 4 } }] }
+    }))));
+    assert!(!tree.accepts(&value(json!({ "left": { "value": 2 } }))));
+}
+
+#[test]
+fn json_schema_intersects_keywords_that_appear_together() {
+    // allOf composition, as emitted for inheritance.
+    let merged = Schema::from_json_schema(&json!({
+        "allOf": [
+            { "$ref": "#/$defs/base" },
+            { "type": "object", "properties": { "name": { "type": "string" } }, "required": ["name"] },
+            { "properties": { "id": { "minimum": 1 } } }
+        ],
+        "$defs": { "base": {
+            "type": "object",
+            "properties": { "id": { "type": "integer", "maximum": 9 } },
+            "required": ["id"],
+            "additionalProperties": false
+        } }
+    }));
+    assert_eq!(merged.type_notation(), "{ id: int, name: string }");
+    assert!(merged.accepts(&value(json!({ "id": 9, "name": "a" }))));
+    assert!(!merged.accepts(&value(json!({ "id": 10, "name": "a" }))));
+    assert!(!merged.accepts(&value(json!({ "id": 1 }))));
+
+    // `type` alongside `enum`, `anyOf` and `$ref`.
+    let notation = |schema| Schema::from_json_schema(&schema).type_notation();
+    assert_eq!(
+        notation(json!({ "type": ["string", "null"], "enum": ["a", "b", null] })),
+        r#"null | "a" | "b""#
+    );
+    assert_eq!(
+        notation(json!({ "type": "string", "anyOf": [{ "maxLength": 3 }, { "type": "null" }] })),
+        "string"
+    );
+    assert_eq!(
+        notation(
+            json!({ "type": "integer", "anyOf": [{ "type": "string" }, { "type": "number" }] })
         ),
+        "int"
+    );
+    // Unsatisfiable combinations stay sound by keeping one side.
+    assert_eq!(
+        notation(json!({ "allOf": [{ "type": "string" }, { "type": "integer" }] })),
+        "string"
+    );
+}
+
+#[test]
+fn json_schema_keeps_numeric_literals_bounds_and_tuples() {
+    let lower = |schema| Schema::from_json_schema(&schema);
+    assert_eq!(
+        lower(json!({ "enum": [3, 1, 2] })),
+        Schema::Integer {
+            min: Some(1),
+            max: Some(3)
+        }
+    );
+    assert_eq!(
+        lower(
+            json!({ "type": "integer", "exclusiveMinimum": 0, "maximum": 10, "exclusiveMaximum": 8 })
+        ),
+        Schema::Integer {
+            min: Some(1),
+            max: Some(7)
+        }
+    );
+    // A closed tuple keeps its element kinds and its length.
+    for tuple in [
+        json!({ "type": "array", "prefixItems": [{ "type": "string" }, { "type": "integer" }], "items": false }),
+        json!({ "type": "array", "items": [{ "type": "string" }, { "type": "integer" }], "additionalItems": false }),
+    ] {
+        let schema = lower(tuple);
+        assert_eq!(schema.type_notation(), "string | int[]");
+        assert!(schema.accepts(&value(json!(["a", 1]))));
+        assert!(!schema.accepts(&value(json!(["a", 1, 2]))));
+        assert!(!schema.accepts(&value(json!([true]))));
+    }
+    // An open tuple admits anything after its prefix.
+    assert_eq!(
+        lower(json!({ "type": "array", "prefixItems": [{ "type": "string" }] })),
         Schema::list(Schema::Any)
+    );
+    assert_eq!(
+        lower(json!({ "prefixItems": [{ "type": "string" }], "items": { "type": "boolean" } }))
+            .type_notation(),
+        "string | boolean[]"
     );
 }
 
