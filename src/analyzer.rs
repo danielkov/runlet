@@ -64,6 +64,15 @@ pub fn compile(
         }
     }
     a.scopes.push(root);
+    if let Err(message) = registry.validate() {
+        a.diagnostics.push(Diagnostic::error(
+            "RL8106",
+            Phase::Analyze,
+            Span::default(),
+            "invalid schema definitions",
+            message,
+        ));
+    }
     a.analyze_program(&program);
     if a.diagnostics.iter().any(|d| d.severity == Severity::Error) {
         return Err(a.diagnostics);
@@ -76,6 +85,66 @@ pub fn compile(
         diagnostics: a.diagnostics,
         referenced_tools: a.referenced_tools,
     })
+}
+
+/// Resolves [`Schema::Ref`]s while two schemas are compared structurally.
+///
+/// Comparing recursive definitions never bottoms out, so each pair that
+/// involves a reference is assumed to hold while it is being checked
+/// (coinduction): meeting the same pair again closes the cycle instead of
+/// unfolding it forever. A fresh instance is used per top-level comparison.
+struct Refs<'a> {
+    registry: &'a ToolRegistry,
+    assumed: Vec<(Relation, Schema, Schema)>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Relation {
+    Converts,
+    FoldAccepts,
+    FoldAnyCompatible,
+    ContainsAny,
+}
+
+impl<'a> Refs<'a> {
+    fn new(registry: &'a ToolRegistry) -> Self {
+        Self {
+            registry,
+            assumed: vec![],
+        }
+    }
+
+    /// Runs `compare` on the resolved pair when either side is a reference;
+    /// returns `None` when neither is. `assumed` is the answer for a pair
+    /// already under comparison, and an answer that does not satisfy
+    /// `holds` withdraws the assumptions made while computing it.
+    fn resolved<R>(
+        &mut self,
+        relation: Relation,
+        (a, e): (&Schema, &Schema),
+        assumed: R,
+        holds: fn(&R) -> bool,
+        compare: fn(&mut Self, &Schema, &Schema) -> R,
+    ) -> Option<R> {
+        if !matches!(a, Schema::Ref { .. }) && !matches!(e, Schema::Ref { .. }) {
+            return None;
+        }
+        if self
+            .assumed
+            .iter()
+            .any(|(r, x, y)| *r == relation && x == a && y == e)
+        {
+            return Some(assumed);
+        }
+        let mark = self.assumed.len();
+        self.assumed.push((relation, a.clone(), e.clone()));
+        let (a, e) = (self.registry.head(a.clone()), self.registry.head(e.clone()));
+        let result = compare(self, &a, &e);
+        if !holds(&result) {
+            self.assumed.truncate(mark);
+        }
+        Some(result)
+    }
 }
 
 struct Analyzer<'a> {
@@ -231,7 +300,18 @@ impl Analyzer<'_> {
         }
         ty
     }
+    /// Schema of an expression, with any reference at its head resolved.
+    ///
+    /// Every schema the analyzer inspects flows through here or through
+    /// [`Self::lookup`], so code that matches on a schema's outermost
+    /// constructor never meets a [`Schema::Ref`]; only comparisons that
+    /// descend into nested schemas resolve references themselves, via
+    /// [`Refs`].
     fn expr(&mut self, e: &Expr) -> Schema {
+        let schema = self.expr_unresolved(e);
+        self.registry.head(schema)
+    }
+    fn expr_unresolved(&mut self, e: &Expr) -> Schema {
         match &e.kind {
             ExprKind::Null => Schema::Null,
             ExprKind::Boolean(_) => Schema::Boolean,
@@ -434,7 +514,7 @@ impl Analyzer<'_> {
                 }
                 for (a, expected) in arguments.iter().zip(&tool.input.parameters) {
                     let actual = self.expr(a);
-                    if conversion_rank(&actual, expected).is_none() {
+                    if conversion_rank(&mut Refs::new(self.registry), &actual, expected).is_none() {
                         self.err(
                             "RL2311",
                             a.span,
@@ -579,7 +659,12 @@ impl Analyzer<'_> {
                 let has_break = !breaks.is_empty();
                 // The body result and every break value participate in the
                 // same structural accumulator widening rules.
-                let result = match fold_unify_with_breaks(&acc, (body.result.span, &out), &breaks) {
+                let result = match fold_unify_with_breaks(
+                    &mut Refs::new(self.registry),
+                    &acc,
+                    (body.result.span, &out),
+                    &breaks,
+                ) {
                     Ok(unified) => {
                         if unified == acc {
                             unified
@@ -594,6 +679,7 @@ impl Analyzer<'_> {
                             let breaks = self.break_schemas.pop().unwrap_or_default();
                             self.scopes.pop();
                             match fold_unify_with_breaks(
+                                &mut Refs::new(self.registry),
                                 &unified,
                                 (body.result.span, &out),
                                 &breaks,
@@ -637,7 +723,9 @@ impl Analyzer<'_> {
                 }
                 for (i, a) in arguments.iter().take(2).enumerate() {
                     let t = self.expr(a);
-                    if conversion_rank(&t, &Schema::string()).is_none() {
+                    if conversion_rank(&mut Refs::new(self.registry), &t, &Schema::string())
+                        .is_none()
+                    {
                         self.err(
                             "RL2314",
                             a.span,
@@ -725,7 +813,11 @@ impl Analyzer<'_> {
         }
     }
     fn lookup(&self, n: &str) -> Option<Schema> {
-        self.scopes.iter().rev().find_map(|s| s.get(n).cloned())
+        self.scopes
+            .iter()
+            .rev()
+            .find_map(|s| s.get(n).cloned())
+            .map(|schema| self.registry.head(schema))
     }
     fn visible_names(&self) -> Vec<String> {
         self.scopes.iter().flat_map(|s| s.keys().cloned()).collect()
@@ -1197,7 +1289,18 @@ fn schema_fields(s: &Schema) -> Vec<String> {
         _ => vec![],
     }
 }
-fn conversion_rank(a: &Schema, e: &Schema) -> Option<u8> {
+fn conversion_rank(cx: &mut Refs<'_>, a: &Schema, e: &Schema) -> Option<u8> {
+    if a != e
+        && let Some(rank) = cx.resolved(
+            Relation::Converts,
+            (a, e),
+            Some(2),
+            Option::is_some,
+            conversion_rank,
+        )
+    {
+        return rank;
+    }
     if a == e || matches!(e, Schema::Any) || matches!(a, Schema::Any) || matches!(a, Schema::Never)
     {
         Some(1)
@@ -1214,7 +1317,7 @@ fn conversion_rank(a: &Schema, e: &Schema) -> Option<u8> {
             )
     ) {
         Some(3)
-    } else if matches!(e,Schema::Union{variants,..} if variants.iter().any(|v|conversion_rank(a,v).is_some()))
+    } else if matches!(e,Schema::Union{variants,..} if variants.iter().any(|v|conversion_rank(cx, a,v).is_some()))
     {
         Some(2)
     } else {
@@ -1225,7 +1328,7 @@ fn conversion_rank(a: &Schema, e: &Schema) -> Option<u8> {
             // value is a single variant, checked at dispatch time.
             (Schema::Union { variants, .. }, e) => variants
                 .iter()
-                .any(|variant| conversion_rank(variant, e).is_some())
+                .any(|variant| conversion_rank(cx, variant, e).is_some())
                 .then_some(2),
             // Same-kind schemas that differ only in constraints (enumerations,
             // bounds, lengths, formats): the analyzer cannot prove the value
@@ -1240,7 +1343,7 @@ fn conversion_rank(a: &Schema, e: &Schema) -> Option<u8> {
                 },
             )
             | (Schema::Map { values: actual }, Schema::Map { values: expected }) => {
-                conversion_rank(actual, expected).map(|_| 2)
+                conversion_rank(cx, actual, expected).map(|_| 2)
             }
             (
                 Schema::Object {
@@ -1258,9 +1361,9 @@ fn conversion_rank(a: &Schema, e: &Schema) -> Option<u8> {
                     match expected.get(key) {
                         Some(target) => {
                             if required.contains(key) {
-                                conversion_rank(&property.schema, &target.schema)?;
+                                conversion_rank(cx, &property.schema, &target.schema)?;
                             } else {
-                                optional_property_rank(&property.schema, &target.schema)?;
+                                optional_property_rank(cx, &property.schema, &target.schema)?;
                             }
                         }
                         None if *additional => {}
@@ -1274,7 +1377,7 @@ fn conversion_rank(a: &Schema, e: &Schema) -> Option<u8> {
             }
             (Schema::Object { properties, .. }, Schema::Map { values }) => {
                 for property in properties.values() {
-                    conversion_rank(&property.schema, values)?;
+                    conversion_rank(cx, &property.schema, values)?;
                 }
                 Some(2)
             }
@@ -1285,7 +1388,7 @@ fn conversion_rank(a: &Schema, e: &Schema) -> Option<u8> {
 /// For an optional object property, `null` means "omit the key" at runtime
 /// (`key: value if cond else null` is the only way to express a conditional
 /// property), so only the non-null part of the actual schema must convert.
-fn optional_property_rank(actual: &Schema, expected: &Schema) -> Option<u8> {
+fn optional_property_rank(cx: &mut Refs<'_>, actual: &Schema, expected: &Schema) -> Option<u8> {
     match actual {
         Schema::Null => Some(2),
         Schema::Union { variants, .. } => {
@@ -1298,10 +1401,10 @@ fn optional_property_rank(actual: &Schema, expected: &Schema) -> Option<u8> {
             }
             non_null
                 .iter()
-                .any(|v| conversion_rank(v, expected).is_some())
+                .any(|v| conversion_rank(cx, v, expected).is_some())
                 .then_some(2)
         }
-        _ => conversion_rank(actual, expected),
+        _ => conversion_rank(cx, actual, expected),
     }
 }
 fn binary_schema(op: BinaryOp, l: &Schema, r: &Schema) -> Option<Schema> {
@@ -1375,19 +1478,20 @@ fn binary_schema(op: BinaryOp, l: &Schema, r: &Schema) -> Option<Schema> {
 /// the lenient any-variant rule, which would collapse the fold to the
 /// seed's schema and hide the found values.
 fn fold_unify_with_breaks(
+    cx: &mut Refs<'_>,
     acc: &Schema,
     body: (Span, &Schema),
     breaks: &[(Span, Schema)],
 ) -> Result<Schema, (Span, String)> {
-    let mut unified = fold_unify(acc, body.1).map_err(|detail| (body.0, detail))?;
+    let mut unified = fold_unify(cx, acc, body.1).map_err(|detail| (body.0, detail))?;
     for (span, value) in breaks {
         if matches!(value, Schema::Never) {
             continue;
         }
-        if !fold_any_compatible(value, &unified) {
+        if !fold_any_compatible(cx, value, &unified) {
             return Err((*span, incompatible_break(&unified, value)));
         }
-        unified = fold_unify(&unified, value)
+        unified = fold_unify(cx, &unified, value)
             .map_err(|_| (*span, incompatible_break(&unified, value)))?;
     }
     Ok(unified)
@@ -1401,41 +1505,62 @@ fn incompatible_break(acc: &Schema, value: &Schema) -> String {
     )
 }
 
-fn schema_contains_any(schema: &Schema) -> bool {
+fn schema_contains_any(cx: &mut Refs<'_>, schema: &Schema) -> bool {
     match schema {
         Schema::Any => true,
-        Schema::Union { variants, .. } => variants.iter().any(schema_contains_any),
-        Schema::List { items, .. } => schema_contains_any(items),
-        Schema::Map { values } => schema_contains_any(values),
+        // A reference already being searched contributes nothing new.
+        Schema::Ref { .. } => cx
+            .resolved(
+                Relation::ContainsAny,
+                (schema, schema),
+                false,
+                |found| !*found,
+                |cx, resolved, _| schema_contains_any(cx, resolved),
+            )
+            .unwrap_or(false),
+        Schema::Union { variants, .. } => variants
+            .iter()
+            .any(|variant| schema_contains_any(cx, variant)),
+        Schema::List { items, .. } => schema_contains_any(cx, items),
+        Schema::Map { values } => schema_contains_any(cx, values),
         Schema::Object { properties, .. } => properties
             .values()
-            .any(|property| schema_contains_any(&property.schema)),
+            .any(|property| schema_contains_any(cx, &property.schema)),
         _ => false,
     }
 }
 
 /// An unknown break value may flow only into an accumulator position that is
 /// already unknown. Other fields may still widen structurally.
-fn fold_any_compatible(actual: &Schema, expected: &Schema) -> bool {
+fn fold_any_compatible(cx: &mut Refs<'_>, actual: &Schema, expected: &Schema) -> bool {
     if matches!(expected, Schema::Any) {
         return true;
+    }
+    if let Some(compatible) = cx.resolved(
+        Relation::FoldAnyCompatible,
+        (actual, expected),
+        true,
+        |compatible| *compatible,
+        fold_any_compatible,
+    ) {
+        return compatible;
     }
     match (actual, expected) {
         (Schema::Any, _) => false,
         (Schema::Union { variants, .. }, expected) => variants
             .iter()
-            .all(|variant| fold_any_compatible(variant, expected)),
+            .all(|variant| fold_any_compatible(cx, variant, expected)),
         (actual, Schema::Union { variants, .. }) => variants
             .iter()
-            .any(|variant| fold_any_compatible(actual, variant)),
+            .any(|variant| fold_any_compatible(cx, actual, variant)),
         (
             Schema::List { items: actual, .. },
             Schema::List {
                 items: expected, ..
             },
-        ) => fold_any_compatible(actual, expected),
+        ) => fold_any_compatible(cx, actual, expected),
         (Schema::Map { values: actual }, Schema::Map { values: expected }) => {
-            fold_any_compatible(actual, expected)
+            fold_any_compatible(cx, actual, expected)
         }
         (
             Schema::Object {
@@ -1449,30 +1574,39 @@ fn fold_any_compatible(actual: &Schema, expected: &Schema) -> bool {
         ) => actual
             .iter()
             .all(|(name, property)| match expected.get(name) {
-                Some(target) => fold_any_compatible(&property.schema, &target.schema),
+                Some(target) => fold_any_compatible(cx, &property.schema, &target.schema),
                 None => *additional,
             }),
         (Schema::Object { properties, .. }, Schema::Map { values }) => properties
             .values()
-            .all(|property| fold_any_compatible(&property.schema, values)),
-        _ => !schema_contains_any(actual),
+            .all(|property| fold_any_compatible(cx, &property.schema, values)),
+        _ => !schema_contains_any(cx, actual),
     }
 }
 
 /// Strict structural compatibility for fold union variants. Unlike callable
 /// conversion, every union variant must fit and formatting conversions are
 /// never accepted.
-fn fold_schema_accepts(actual: &Schema, expected: &Schema) -> bool {
+fn fold_schema_accepts(cx: &mut Refs<'_>, actual: &Schema, expected: &Schema) -> bool {
     if actual == expected || matches!(actual, Schema::Never) || matches!(expected, Schema::Any) {
         return true;
+    }
+    if let Some(accepted) = cx.resolved(
+        Relation::FoldAccepts,
+        (actual, expected),
+        true,
+        |accepted| *accepted,
+        fold_schema_accepts,
+    ) {
+        return accepted;
     }
     match (actual, expected) {
         (Schema::Union { variants, .. }, expected) => variants
             .iter()
-            .all(|variant| fold_schema_accepts(variant, expected)),
+            .all(|variant| fold_schema_accepts(cx, variant, expected)),
         (actual, Schema::Union { variants, .. }) => variants
             .iter()
-            .any(|variant| fold_schema_accepts(actual, variant)),
+            .any(|variant| fold_schema_accepts(cx, actual, variant)),
         (Schema::String { .. }, Schema::String { .. })
         | (Schema::Integer { .. }, Schema::Integer { .. })
         | (Schema::Integer { .. }, Schema::Number { .. })
@@ -1484,7 +1618,7 @@ fn fold_schema_accepts(actual: &Schema, expected: &Schema) -> bool {
             },
         )
         | (Schema::Map { values: actual }, Schema::Map { values: expected }) => {
-            fold_schema_accepts(actual, expected)
+            fold_schema_accepts(cx, actual, expected)
         }
         (
             Schema::Object {
@@ -1495,7 +1629,7 @@ fn fold_schema_accepts(actual: &Schema, expected: &Schema) -> bool {
             Schema::Map { values },
         ) => properties
             .values()
-            .all(|property| fold_schema_accepts(&property.schema, values)),
+            .all(|property| fold_schema_accepts(cx, &property.schema, values)),
         (
             Schema::Object {
                 properties: actual,
@@ -1515,7 +1649,7 @@ fn fold_schema_accepts(actual: &Schema, expected: &Schema) -> bool {
                 && actual
                     .iter()
                     .all(|(name, property)| match expected.get(name) {
-                        Some(target) => fold_schema_accepts(&property.schema, &target.schema),
+                        Some(target) => fold_schema_accepts(cx, &property.schema, &target.schema),
                         None => *expected_additional,
                     })
         }
@@ -1523,7 +1657,7 @@ fn fold_schema_accepts(actual: &Schema, expected: &Schema) -> bool {
     }
 }
 
-fn fold_unify(acc: &Schema, out: &Schema) -> Result<Schema, String> {
+fn fold_unify(cx: &mut Refs<'_>, acc: &Schema, out: &Schema) -> Result<Schema, String> {
     if acc == out {
         return Ok(acc.clone());
     }
@@ -1533,24 +1667,39 @@ fn fold_unify(acc: &Schema, out: &Schema) -> Result<Schema, String> {
     if matches!(out, Schema::Any) {
         return Ok(Schema::Any);
     }
+    // A reference cannot be widened structurally without unfolding it
+    // forever, so one side must already accept the other.
+    if matches!(acc, Schema::Ref { .. }) || matches!(out, Schema::Ref { .. }) {
+        if fold_schema_accepts(cx, out, acc) {
+            return Ok(acc.clone());
+        }
+        if fold_schema_accepts(cx, acc, out) {
+            return Ok(out.clone());
+        }
+        return Err(format!(
+            "the initial value is {} but the body returns {}",
+            acc.type_notation(),
+            out.type_notation()
+        ));
+    }
     // Fold unions have one structural schema plus optional null. Unify every
     // output variant instead of accepting a union when only one variant fits.
     if let Schema::Union { variants, .. } = out {
         let mut unified = acc.clone();
         for variant in variants {
-            unified = fold_unify(&unified, variant)?;
+            unified = fold_unify(cx, &unified, variant)?;
         }
         return Ok(unified);
     }
     if let Schema::Union { variants, .. } = acc {
-        if fold_schema_accepts(out, acc) {
+        if fold_schema_accepts(cx, out, acc) {
             return Ok(acc.clone());
         }
         for (index, variant) in variants.iter().enumerate() {
             if matches!(variant, Schema::Null) {
                 continue;
             }
-            if let Ok(widened) = fold_unify(variant, out) {
+            if let Ok(widened) = fold_unify(cx, variant, out) {
                 let mut widened_variants = variants.clone();
                 widened_variants[index] = widened;
                 return Ok(union(widened_variants));
@@ -1571,12 +1720,12 @@ fn fold_unify(acc: &Schema, out: &Schema) -> Result<Schema, String> {
             return Ok(union(vec![other.clone(), Schema::Null]));
         }
         (Schema::List { items: a, .. }, Schema::List { items: b, .. }) => {
-            return fold_unify(a, b)
+            return fold_unify(cx, a, b)
                 .map(Schema::list)
                 .map_err(|detail| format!("list item: {detail}"));
         }
         (Schema::Map { values: a }, Schema::Map { values: b }) => {
-            return fold_unify(a, b)
+            return fold_unify(cx, a, b)
                 .map(|values| Schema::Map {
                     values: Box::new(values),
                 })
@@ -1596,7 +1745,7 @@ fn fold_unify(acc: &Schema, out: &Schema) -> Result<Schema, String> {
         ) if a.len() == b.len() && a.keys().eq(b.keys()) => {
             let mut properties = BTreeMap::new();
             for (key, property) in a {
-                let unified = fold_unify(&property.schema, &b[key].schema)
+                let unified = fold_unify(cx, &property.schema, &b[key].schema)
                     .map_err(|detail| format!("property `{key}`: {detail}"))?;
                 properties.insert(key.clone(), crate::Property::new(unified));
             }
@@ -1611,10 +1760,10 @@ fn fold_unify(acc: &Schema, out: &Schema) -> Result<Schema, String> {
     // A body that converts back keeps the seed's schema. Widening by
     // structural conversion (never formatting) covers the rest
     // (`{}` seed → map).
-    if fold_schema_accepts(out, acc) {
+    if fold_schema_accepts(cx, out, acc) {
         return Ok(acc.clone());
     }
-    if fold_schema_accepts(acc, out) {
+    if fold_schema_accepts(cx, acc, out) {
         return Ok(out.clone());
     }
     Err(format!(
