@@ -26,6 +26,12 @@ pub struct CompiledProgram {
     pub registry_digest: String,
     /// Non-fatal diagnostics, such as warnings about pruned bindings.
     pub diagnostics: Vec<Diagnostic>,
+    /// Fully qualified name of every registered callable the source invokes,
+    /// including prelude intrinsics and calls in branches, loop bodies, catch
+    /// blocks, and pruned bindings that may never run. A superset of what any
+    /// execution dispatches, so a host can check permissions or credentials
+    /// for a whole program before running it.
+    pub referenced_tools: BTreeSet<String>,
 }
 
 /// Parses and analyzes source against a tool registry and host inputs.
@@ -43,6 +49,7 @@ pub fn compile(
         diagnostics: vec![],
         scopes: vec![],
         break_schemas: vec![],
+        referenced_tools: BTreeSet::new(),
     };
     let mut root = BTreeMap::new();
     for i in inputs {
@@ -67,6 +74,7 @@ pub fn compile(
         source_digest: hex::encode(Sha256::digest(source.as_bytes())),
         registry_digest: registry.digest(),
         diagnostics: a.diagnostics,
+        referenced_tools: a.referenced_tools,
     })
 }
 
@@ -77,6 +85,7 @@ struct Analyzer<'a> {
     /// Break values collected for the fold body currently being analyzed.
     /// Nested folds push their own collector so breaks never escape outward.
     break_schemas: Vec<Vec<(Span, Schema)>>,
+    referenced_tools: BTreeSet<String>,
 }
 impl Analyzer<'_> {
     fn analyze_program(&mut self, p: &Program) {
@@ -406,6 +415,7 @@ impl Analyzer<'_> {
                     );
                     return Schema::Any;
                 };
+                self.referenced_tools.insert(name.clone());
                 let (min, max) = (tool.input.required_count(), tool.input.parameters.len());
                 if arguments.len() < min || arguments.len() > max {
                     let expected = if min == max {
@@ -1055,7 +1065,7 @@ fn collect_block_names(
 /// trees combinatorially during analysis.
 const UNION_VARIANT_CAP: usize = 8;
 
-fn union(x: Vec<Schema>) -> Schema {
+pub(crate) fn union(x: Vec<Schema>) -> Schema {
     let mut flat: Vec<Schema> = Vec::new();
     let push = |s: Schema, flat: &mut Vec<Schema>| {
         if !flat.contains(&s) {

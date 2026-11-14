@@ -21,6 +21,7 @@
 #![warn(missing_docs)]
 
 mod analyzer;
+mod cancel;
 mod diagnostic;
 mod graph;
 mod heal;
@@ -34,6 +35,7 @@ mod syntax;
 mod value;
 
 pub use analyzer::{CompiledProgram, ExternalInput, compile};
+pub use cancel::{CancellationToken, Cancelled};
 pub use diagnostic::{Diagnostic, Fix, Phase, Severity, Span};
 pub use graph::{Edge, EdgeKind, Graph, GraphChange, GraphEvent, Node, NodeKind, NodeState};
 pub use heal::{Healed, heal};
@@ -42,7 +44,7 @@ pub use progress::{
     ProgressChange, ProgressEdge, ProgressEdgeKind, ProgressEvent, ProgressNode, ProgressOutcome,
     ProgressReceiver, ProgressRecvError, ProgressSender, ProgressState, progress_channel,
 };
-pub use runtime::{Execution, Runtime, RuntimeBuilder, ToolContext, ToolError};
+pub use runtime::{Execution, RunOptions, Runtime, RuntimeBuilder, ToolContext, ToolError};
 pub use schema::{CallSchema, ExecutionPolicy, Property, Schema, ToolDescriptor, ToolRegistry};
 pub use syntax::{BinaryOp, Block, Expr, ExprKind, ObjectKey, Program, Stmt, StmtKind, UnaryOp};
 pub use value::{CanonicalValue, ValueError};

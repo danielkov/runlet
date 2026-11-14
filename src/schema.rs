@@ -319,6 +319,28 @@ impl Schema {
         }
     }
 
+    /// Lowers a JSON Schema document into Runlet's smaller schema vocabulary.
+    ///
+    /// The conversion is total and only ever *widens*: every JSON value the
+    /// source schema accepts is accepted by the result, and anything Runlet
+    /// cannot express becomes [`Schema::Any`]. It is intended for adapting
+    /// external tool catalogs (MCP `inputSchema`/`outputSchema`, OpenAPI).
+    ///
+    /// - `type` (including type arrays and OpenAPI `nullable`), `enum`,
+    ///   `const`, `anyOf`/`oneOf`, and single-element `allOf` are lowered.
+    /// - Local `$ref`s (`#/$defs/...`) resolve against `schema`; remote and
+    ///   recursive references widen to `Any`.
+    /// - `number` becomes `integer | number`, because canonical values keep
+    ///   integral JSON numbers as integers.
+    /// - `additionalProperties: false` closes an object; a schema-valued
+    ///   `additionalProperties` with no `properties` becomes a map.
+    /// - Property `description`s become [`Property::documentation`].
+    /// - Bounds that are not inclusive integers/numbers, `pattern`, tuples,
+    ///   multi-element `allOf`, `not`, and conditionals are dropped.
+    pub fn from_json_schema(schema: &serde_json::Value) -> Self {
+        lower_json_schema(schema, schema, 0)
+    }
+
     /// Returns whether a canonical value satisfies this schema.
     pub fn accepts(&self, v: &CanonicalValue) -> bool {
         match (self, v) {
@@ -378,4 +400,175 @@ impl Schema {
             _ => false,
         }
     }
+}
+
+/// Nesting/reference depth after which JSON Schema lowering widens to `Any`.
+/// Bounds recursive `$ref` cycles without tracking visited pointers.
+const JSON_SCHEMA_DEPTH_LIMIT: usize = 32;
+
+fn lower_json_schema(root: &serde_json::Value, node: &serde_json::Value, depth: usize) -> Schema {
+    use crate::analyzer::union;
+    use serde_json::Value as J;
+    let J::Object(object) = node else {
+        return Schema::Any;
+    };
+    if depth >= JSON_SCHEMA_DEPTH_LIMIT {
+        return Schema::Any;
+    }
+    let lower = |node: &J| lower_json_schema(root, node, depth + 1);
+    let nullable = |schema: Schema| {
+        if object.get("nullable") == Some(&J::Bool(true)) {
+            union(vec![schema, Schema::Null])
+        } else {
+            schema
+        }
+    };
+    if let Some(reference) = object.get("$ref") {
+        return nullable(
+            reference
+                .as_str()
+                .and_then(|r| r.strip_prefix('#'))
+                .and_then(|pointer| root.pointer(pointer))
+                .map_or(Schema::Any, lower),
+        );
+    }
+    if let Some(constant) = object.get("const") {
+        return nullable(json_literal_schema(std::slice::from_ref(constant)));
+    }
+    if let Some(J::Array(values)) = object.get("enum") {
+        return nullable(json_literal_schema(values));
+    }
+    for keyword in ["anyOf", "oneOf"] {
+        if let Some(J::Array(variants)) = object.get(keyword) {
+            return nullable(union(variants.iter().map(lower).collect()));
+        }
+    }
+    let by_type = |name: &str| match name {
+        "null" => Schema::Null,
+        "boolean" => Schema::Boolean,
+        "integer" => Schema::Integer {
+            min: object.get("minimum").and_then(J::as_i64),
+            max: object.get("maximum").and_then(J::as_i64),
+        },
+        "number" => union(vec![
+            Schema::INTEGER,
+            Schema::Number {
+                min: object.get("minimum").and_then(J::as_f64),
+                max: object.get("maximum").and_then(J::as_f64),
+            },
+        ]),
+        "string" => Schema::String {
+            format: object.get("format").and_then(J::as_str).map(str::to_owned),
+            enumeration: vec![],
+            min_len: json_usize(object.get("minLength")),
+            max_len: json_usize(object.get("maxLength")),
+        },
+        "array" => Schema::List {
+            items: Box::new(match object.get("items") {
+                Some(items @ J::Object(_)) if !object.contains_key("prefixItems") => lower(items),
+                _ => Schema::Any,
+            }),
+            min_len: json_usize(object.get("minItems")),
+            max_len: json_usize(object.get("maxItems")),
+        },
+        "object" => {
+            let properties = match object.get("properties") {
+                Some(J::Object(properties)) => properties
+                    .iter()
+                    .map(|(name, schema)| {
+                        let mut property = Property::new(lower(schema));
+                        if let Some(text) = schema.get("description").and_then(J::as_str) {
+                            property.documentation = text.to_owned();
+                        }
+                        (name.clone(), property)
+                    })
+                    .collect(),
+                _ => BTreeMap::new(),
+            };
+            let required = match object.get("required") {
+                Some(J::Array(names)) => names
+                    .iter()
+                    .filter_map(|name| name.as_str().map(str::to_owned))
+                    .collect(),
+                _ => BTreeSet::new(),
+            };
+            match object.get("additionalProperties") {
+                Some(values @ J::Object(_))
+                    if properties.is_empty()
+                        && required.is_empty()
+                        && !object.contains_key("patternProperties") =>
+                {
+                    Schema::Map {
+                        values: Box::new(lower(values)),
+                    }
+                }
+                additional => Schema::Object {
+                    properties,
+                    required,
+                    additional: additional != Some(&J::Bool(false))
+                        || object.contains_key("patternProperties"),
+                },
+            }
+        }
+        _ => Schema::Any,
+    };
+    let schema = match object.get("type") {
+        Some(J::String(name)) => by_type(name),
+        Some(J::Array(names)) => union(
+            names
+                .iter()
+                .map(|name| name.as_str().map_or(Schema::Any, by_type))
+                .collect(),
+        ),
+        _ => match object.get("allOf") {
+            Some(J::Array(all)) if all.len() == 1 => lower(&all[0]),
+            Some(_) => Schema::Any,
+            None if ["properties", "required", "additionalProperties"]
+                .iter()
+                .any(|k| object.contains_key(*k)) =>
+            {
+                by_type("object")
+            }
+            None if object.contains_key("items") || object.contains_key("prefixItems") => {
+                by_type("array")
+            }
+            None => Schema::Any,
+        },
+    };
+    nullable(schema)
+}
+
+fn json_usize(value: Option<&serde_json::Value>) -> Option<usize> {
+    value?.as_u64()?.try_into().ok()
+}
+
+/// Schema accepting exactly the kinds (and, for strings, the values) of a
+/// JSON Schema `enum`/`const` literal list.
+fn json_literal_schema(values: &[serde_json::Value]) -> Schema {
+    use serde_json::Value as J;
+    let mut strings = vec![];
+    let mut others = vec![];
+    for value in values {
+        match value {
+            J::String(text) => {
+                if !strings.contains(text) {
+                    strings.push(text.clone());
+                }
+            }
+            J::Null => others.push(Schema::Null),
+            J::Bool(_) => others.push(Schema::Boolean),
+            J::Number(n) if n.is_i64() => others.push(Schema::INTEGER),
+            J::Number(_) => others.push(Schema::NUMBER),
+            J::Array(_) | J::Object(_) => return Schema::Any,
+        }
+    }
+    if !strings.is_empty() {
+        others.push(Schema::String {
+            format: None,
+            enumeration: strings,
+            min_len: None,
+            max_len: None,
+        });
+    }
+    crate::analyzer::union(others)
 }

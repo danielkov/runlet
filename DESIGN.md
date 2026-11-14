@@ -656,6 +656,8 @@ Ready independent calls may start in any order. Programs cannot observe scheduli
 
 Dropping a branch, failing a loop, or retrying a boundary propagates a cancellation token to owned running calls. Tool executors report whether cancellation is supported and whether completion after cancellation is possible. Late results append an `OrphanedCompletion` event referencing the terminal cancelled node; they are evidence, not a node-state transition, and cannot satisfy a newer attempt. If such a result represents an external side effect, it remains visible as an orphaned completion in observability.
 
+The in-process executor implements the host-requested subset: a `CancellationToken` supplied per run stops further dispatch, interrupts retry backoff, is exposed to handlers through the call context, and ends the run with `RL6110 RUN_CANCELLED`, which boundaries neither retry nor catch. It does not yet wait for handler acknowledgement or record `Cancelling`/`Cancelled` node states; interrupted nodes are reported as failed.
+
 Program cancellation is durable. Resumption does not restart a user-cancelled run unless the host explicitly creates a new resume generation.
 
 ## 5. Durable execution

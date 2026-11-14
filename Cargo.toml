@@ -21,4 +21,19 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
 thiserror = "2"
+tokio = { version = "1", features = ["rt"], optional = true }
 unicode-ident = "1"
+
+[features]
+# Async tool handlers and `Runtime::run_async`, driven by the host's Tokio runtime.
+tokio = ["dep:tokio"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+
+[[test]]
+name = "async_tools"
+required-features = ["tokio"]
