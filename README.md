@@ -263,6 +263,77 @@ Compilation errors happen before execution and produce no progress. A terminal
 run failure does not invent terminal states for unfinished nodes. Capacity must
 be positive and bounds queued metadata, not the existing execution graph.
 
+### Adapting external tool catalogs
+
+Three helpers cover the usual glue for hosts that expose tools described
+elsewhere, such as MCP servers or OpenAPI operations:
+
+```rust
+use runlet::{CanonicalValue, Schema};
+
+// JSON Schema -> Runlet schema. Total and widening: `allOf`, tuples, local
+// `$ref`s and combined keywords are lowered; what Runlet cannot express
+// (`not`, conditionals, remote or recursive `$ref`s) becomes `Any`.
+let input = Schema::from_json_schema(&serde_json::json!({
+    "type": "object",
+    "properties": { "query": { "type": "string" } },
+    "required": ["query"]
+}));
+
+// JSON <-> canonical values for handler arguments and results.
+let argument = CanonicalValue::from_json(serde_json::json!({ "query": "open" }))?;
+assert!(input.accepts(&argument));
+let wire: serde_json::Value = argument.to_json()?;
+```
+
+`CompiledProgram::referenced_tools` lists every registered callable the source
+invokes, including calls in branches that may never run. Check permissions or
+credentials against it after `compile` and before `run`, so a program is
+rejected before its first effect rather than halfway through.
+
+### Cancellation
+
+Pass a `CancellationToken` through `RunOptions` and cancel it from any thread:
+
+```rust
+use runlet::{CancellationToken, RunOptions, Runtime};
+
+let runtime = Runtime::builder().with_prelude().build()?;
+let program = runtime.compile(r#"return text.upper("hello")"#).expect("valid source");
+let token = CancellationToken::new();
+let execution = runtime.run_with(&program, RunOptions::new().cancellation(token.clone()))?;
+```
+
+After `token.cancel()` the executor dispatches no further tools, ends retry
+backoff sleeps, and returns `RL6110 RUN_CANCELLED`; boundaries neither retry
+nor catch it, and progress ends with `Finished(Cancelled)`. Cancellation is
+cooperative. A handler that is already running is not interrupted: it receives
+the token as `ToolContext::cancellation` and should return early. Effects that
+were already dispatched are not undone, and nodes interrupted by cancellation
+are reported as failed.
+
+### Async hosts
+
+With the `tokio` feature, `RuntimeBuilder::async_tool` registers handlers that
+return futures, and `Runtime::run_async` runs a program without blocking the
+calling task:
+
+```rust,ignore
+let runtime = Runtime::builder()
+    .registry(tools)
+    .async_tool("crm.find", |args, _context| async move { client.find(args).await })
+    .build()?;
+let program = runtime.compile(source)?;
+let execution = runtime.run_async(&program, RunOptions::new()).await?;
+```
+
+The executor itself stays thread-based: a run occupies one `spawn_blocking`
+thread plus its loop workers, and each in-flight async call parks one of those
+threads while Tokio drives the future. `dispatch_limit` and
+`worker_thread_limit` therefore bound a run's threads. Dropping the `run_async`
+future cancels the run, and a cancelled run drops in-flight tool futures at
+their next yield.
+
 `run`, `run_observed`, and execution graph snapshots remain available. The legacy
 `run_observed` callback contains values and executes under the graph lock; it must
 not block, reenter, or panic. Use the bounded stream for isolated host progress.
@@ -330,9 +401,10 @@ cargo test
 
 The current implementation includes parsing, schema analysis, canonical
 values, lazy root-reachable execution, dynamic branches, bounded concurrent
-loops, retry boundaries, and live graph events. Durable journals, recovery,
-cancellation, and production executor interfaces remain roadmap work described
-in [`DESIGN.md`](DESIGN.md).
+loops, retry boundaries, cooperative run cancellation, and live graph events.
+Durable journals, recovery, cancellation acknowledgement by tool executors, and
+production executor interfaces remain roadmap work described in
+[`DESIGN.md`](DESIGN.md).
 
 ## Editor support
 

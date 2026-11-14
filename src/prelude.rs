@@ -751,24 +751,7 @@ fn list_range(args: &[V], _: &ToolContext) -> Result<V, ToolError> {
 // json ----------------------------------------------------------------------
 
 fn from_json(value: serde_json::Value) -> Result<V, ToolError> {
-    Ok(match value {
-        serde_json::Value::Null => V::Null,
-        serde_json::Value::Bool(x) => V::Boolean(x),
-        serde_json::Value::Number(x) => match x.as_i64() {
-            Some(i) => V::Integer(i),
-            None => V::number(x.as_f64().unwrap_or(f64::NAN))
-                .map_err(|_| err("RL5103", "NON_FINITE_NUMBER"))?,
-        },
-        serde_json::Value::String(x) => V::String(x),
-        serde_json::Value::Array(xs) => {
-            V::List(xs.into_iter().map(from_json).collect::<Result<_, _>>()?)
-        }
-        serde_json::Value::Object(o) => V::Object(
-            o.into_iter()
-                .map(|(k, v)| Ok((k, from_json(v)?)))
-                .collect::<Result<_, ToolError>>()?,
-        ),
-    })
+    V::from_json(value).map_err(|_| err("RL5103", "NON_FINITE_NUMBER"))
 }
 
 fn json_parse(args: &[V], _: &ToolContext) -> Result<V, ToolError> {

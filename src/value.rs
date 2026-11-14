@@ -75,6 +75,57 @@ impl CanonicalValue {
         Ok(out)
     }
 
+    /// Converts parsed JSON into a canonical value.
+    ///
+    /// Numbers representable as `i64` become integers; all others become
+    /// binary64 numbers. JSON has no byte type, so the result never contains
+    /// [`CanonicalValue::Bytes`].
+    pub fn from_json(value: serde_json::Value) -> Result<Self, ValueError> {
+        Ok(match value {
+            serde_json::Value::Null => Self::Null,
+            serde_json::Value::Bool(x) => Self::Boolean(x),
+            serde_json::Value::Number(x) => match x.as_i64() {
+                Some(i) => Self::Integer(i),
+                None => Self::number(x.as_f64().unwrap_or(f64::NAN))?,
+            },
+            serde_json::Value::String(x) => Self::String(x),
+            serde_json::Value::Array(xs) => Self::List(
+                xs.into_iter()
+                    .map(Self::from_json)
+                    .collect::<Result<_, _>>()?,
+            ),
+            serde_json::Value::Object(o) => Self::Object(
+                o.into_iter()
+                    .map(|(k, v)| Ok((k, Self::from_json(v)?)))
+                    .collect::<Result<_, ValueError>>()?,
+            ),
+        })
+    }
+
+    /// Converts the value into a JSON tree, the inverse of [`Self::from_json`].
+    ///
+    /// Raw byte values return [`ValueError::NotJsonRepresentable`].
+    pub fn to_json(&self) -> Result<serde_json::Value, ValueError> {
+        Ok(match self {
+            Self::Null => serde_json::Value::Null,
+            Self::Boolean(x) => (*x).into(),
+            Self::Integer(x) => (*x).into(),
+            Self::Number(x) => serde_json::Number::from_f64(*x)
+                .map(serde_json::Value::Number)
+                .ok_or(ValueError::NonFiniteNumber)?,
+            Self::String(x) => x.clone().into(),
+            Self::Bytes(_) => return Err(ValueError::NotJsonRepresentable),
+            Self::List(xs) => {
+                serde_json::Value::Array(xs.iter().map(Self::to_json).collect::<Result<_, _>>()?)
+            }
+            Self::Object(o) => serde_json::Value::Object(
+                o.iter()
+                    .map(|(k, v)| Ok((k.clone(), v.to_json()?)))
+                    .collect::<Result<_, ValueError>>()?,
+            ),
+        })
+    }
+
     fn encode(&self, out: &mut Vec<u8>) -> Result<(), ValueError> {
         match self {
             Self::Null => out.push(0x00),

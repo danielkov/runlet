@@ -1,11 +1,13 @@
 use crate::analyzer::{CompiledProgram, ExternalInput, compile};
 use crate::progress::{ProgressChange, ProgressEvent, ProgressOutcome, ProgressSender};
 use crate::{
-    BinaryOp, Block, CanonicalValue as V, Diagnostic, Expr, ExprKind, Graph, GraphChange,
-    GraphEvent, NodeKind, NodeState, Schema, Span, ToolRegistry, UnaryOp,
+    BinaryOp, Block, CancellationToken, CanonicalValue as V, Diagnostic, Expr, ExprKind, Graph,
+    GraphChange, GraphEvent, NodeKind, NodeState, Schema, Span, ToolRegistry, UnaryOp,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
+#[cfg(feature = "tokio")]
+use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use thiserror::Error;
@@ -25,6 +27,34 @@ pub struct ToolContext {
     pub attempt: u32,
     /// Version declared by the tool descriptor.
     pub schema_version: String,
+    /// Cancellation state of the enclosing run. Long-running handlers should
+    /// observe it and return early; the run reports `RL6110` regardless of
+    /// the error a cancelled handler returns.
+    pub cancellation: CancellationToken,
+}
+
+/// Per-run settings for [`Runtime::run_with`].
+#[derive(Default)]
+pub struct RunOptions {
+    progress: Option<ProgressSender>,
+    cancellation: Option<CancellationToken>,
+}
+
+impl RunOptions {
+    /// Options equivalent to a plain [`Runtime::run`].
+    pub fn new() -> Self {
+        Self::default()
+    }
+    /// Publishes value-free progress; see [`Runtime::run_with_progress`].
+    pub fn progress(mut self, progress: ProgressSender) -> Self {
+        self.progress = Some(progress);
+        self
+    }
+    /// Lets the host stop the run; see [`CancellationToken`].
+    pub fn cancellation(mut self, cancellation: CancellationToken) -> Self {
+        self.cancellation = Some(cancellation);
+        self
+    }
 }
 
 #[derive(Debug, Clone, Error)]
@@ -177,7 +207,37 @@ impl Runtime {
     ///
     /// The program must have been compiled against an equivalent registry.
     pub fn run(&self, program: &CompiledProgram) -> Result<Execution, ToolError> {
-        self.run_inner(program, Arc::new(LiveGraph::new(Observation::None)))
+        self.run_with(program, RunOptions::new())
+    }
+
+    /// Executes a compiled program with per-run [`RunOptions`].
+    ///
+    /// With a cancellation token, a cancelled run stops dispatching tools and
+    /// fails with `RL6110 RUN_CANCELLED`, which no `boundary` can retry or
+    /// catch. Cancellation is cooperative: a run whose result was already
+    /// produced still returns it, and effects already dispatched are not
+    /// undone.
+    pub fn run_with(
+        &self,
+        program: &CompiledProgram,
+        options: RunOptions,
+    ) -> Result<Execution, ToolError> {
+        let cancellation = options.cancellation.unwrap_or_default();
+        let Some(progress) = options.progress else {
+            return self.run_inner(
+                program,
+                Arc::new(LiveGraph::new(Observation::None)),
+                cancellation,
+            );
+        };
+        let graph = Arc::new(LiveGraph::new(Observation::Progress(progress)));
+        let result = self.run_inner(program, graph.clone(), cancellation.clone());
+        graph.finished(match &result {
+            Ok(_) => ProgressOutcome::Succeeded,
+            Err(_) if cancellation.is_cancelled() => ProgressOutcome::Cancelled,
+            Err(_) => ProgressOutcome::Failed,
+        });
+        result
     }
 
     /// Runs a program and reports graph changes from executor threads as they happen.
@@ -197,6 +257,7 @@ impl Runtime {
         self.run_inner(
             program,
             Arc::new(LiveGraph::new(Observation::Legacy(Arc::new(observer)))),
+            CancellationToken::new(),
         )
     }
 
@@ -210,20 +271,14 @@ impl Runtime {
         program: &CompiledProgram,
         progress: ProgressSender,
     ) -> Result<Execution, ToolError> {
-        let graph = Arc::new(LiveGraph::new(Observation::Progress(progress)));
-        let result = self.run_inner(program, graph.clone());
-        graph.finished(if result.is_ok() {
-            ProgressOutcome::Succeeded
-        } else {
-            ProgressOutcome::Failed
-        });
-        result
+        self.run_with(program, RunOptions::new().progress(progress))
     }
 
     fn run_inner(
         &self,
         program: &CompiledProgram,
         graph: Arc<LiveGraph>,
+        cancellation: CancellationToken,
     ) -> Result<Execution, ToolError> {
         if program.registry_digest != self.registry.digest() {
             return Err(ToolError::new(
@@ -250,6 +305,9 @@ impl Runtime {
             worker_budget: Arc::new(AtomicUsize::new(self.max_worker_threads)),
             after_gates: vec![],
             lexical_scope: 0,
+            cancellation,
+            #[cfg(feature = "tokio")]
+            tokio: tokio::runtime::Handle::try_current().ok(),
         };
         let mut root = HashMap::new();
         for (n, (_, v)) in &self.inputs {
@@ -282,9 +340,50 @@ impl Runtime {
                 })
             }
             Err(e) => {
+                // A cancelled run reports one stable code, whatever error the
+                // interrupted work happened to surface first.
+                let e = if ev.cancellation.is_cancelled() {
+                    let mut cancelled = cancelled_error();
+                    cancelled.span = e.span;
+                    cancelled
+                } else {
+                    e
+                };
                 ev.graph.fail(node, e.to_string());
                 Err(e)
             }
+        }
+    }
+
+    /// Executes a program without blocking the calling async task.
+    ///
+    /// The run occupies one `spawn_blocking` thread plus its loop workers.
+    /// Dropping the returned future cancels the run (as does the token in
+    /// `options`, if any), so an abandoned request stops dispatching tools.
+    /// The runtime and program are cloned into the blocking task.
+    #[cfg(feature = "tokio")]
+    pub async fn run_async(
+        &self,
+        program: &CompiledProgram,
+        mut options: RunOptions,
+    ) -> Result<Execution, ToolError> {
+        struct CancelOnDrop(Option<CancellationToken>);
+        impl Drop for CancelOnDrop {
+            fn drop(&mut self) {
+                if let Some(cancellation) = &self.0 {
+                    cancellation.cancel();
+                }
+            }
+        }
+        let cancellation = options.cancellation.get_or_insert_default().clone();
+        let (runtime, program) = (self.clone(), program.clone());
+        let mut guard = CancelOnDrop(Some(cancellation));
+        let joined = tokio::task::spawn_blocking(move || runtime.run_with(&program, options)).await;
+        guard.0 = None;
+        match joined {
+            Ok(result) => result,
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            Err(_) => Err(cancelled_error()),
         }
     }
 
@@ -328,6 +427,47 @@ impl RuntimeBuilder {
     {
         self.runtime.handlers.insert(name.into(), Arc::new(handler));
         self
+    }
+    /// Adds or replaces an asynchronous implementation for a registered tool.
+    ///
+    /// The future is driven to completion on the Tokio runtime that is
+    /// current when the run starts, from the executor thread that dispatched
+    /// the call, so `loop_concurrency` and `dispatch_limit` bound in-flight
+    /// futures exactly as they bound synchronous handlers. If the run is
+    /// cancelled the future is dropped at its next yield and the call fails.
+    ///
+    /// Start such runs with [`Runtime::run_async`], or from
+    /// `tokio::task::spawn_blocking`. Calling the blocking `run*` methods
+    /// directly on an async worker thread panics inside Tokio, and starting a
+    /// run with no runtime current fails the call with `RL8105`.
+    #[cfg(feature = "tokio")]
+    pub fn async_tool<F, Fut>(self, name: impl Into<String>, handler: F) -> Self
+    where
+        F: Fn(Vec<V>, ToolContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<V, ToolError>>,
+    {
+        self.tool(name, move |args, ctx| {
+            let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
+                lang(
+                    "RL8105",
+                    "async tool dispatched without a current Tokio runtime; \
+                     start the run with `run_async` or `spawn_blocking`",
+                )
+            })?;
+            let cancellation = ctx.cancellation.clone();
+            let call = handler(args.to_vec(), ctx.clone());
+            runtime.block_on(async move {
+                let mut call = std::pin::pin!(call);
+                let mut cancelled = std::pin::pin!(cancellation.cancelled());
+                std::future::poll_fn(|cx| {
+                    if cancelled.as_mut().poll(cx).is_ready() {
+                        return std::task::Poll::Ready(Err(cancelled_error()));
+                    }
+                    call.as_mut().poll(cx)
+                })
+                .await
+            })
+        })
     }
     /// Sets the host-owned concurrency used by every `for` loop.
     pub fn loop_concurrency(mut self, concurrency: u32) -> Self {
@@ -479,6 +619,11 @@ struct Evaluator<'a> {
     after_gates: Vec<(usize, usize)>,
     /// Scope containing the expression currently being evaluated.
     lexical_scope: usize,
+    cancellation: CancellationToken,
+    /// Runtime entered around handler dispatch so tools invoked on loop
+    /// worker threads can still reach the host's reactor.
+    #[cfg(feature = "tokio")]
+    tokio: Option<tokio::runtime::Handle>,
 }
 
 struct LiveGraph {
@@ -1186,6 +1331,7 @@ impl Evaluator<'_> {
             dispatch_id,
             attempt: self.attempt,
             schema_version: desc.schema_version.clone(),
+            cancellation: self.cancellation.clone(),
         };
         let handler = self
             .runtime
@@ -1196,7 +1342,13 @@ impl Evaluator<'_> {
         let dispatches = self.dispatches.clone();
         self.graph.dispatching(node);
         let permit = dispatches.acquire();
+        // Cancellation may have arrived while queued for capacity.
+        if self.cancellation.is_cancelled() {
+            return self.finish(node, Err(cancelled_error()));
+        }
         self.graph.running(node);
+        #[cfg(feature = "tokio")]
+        let _reactor = self.tokio.as_ref().map(tokio::runtime::Handle::enter);
         let mut r = handler(&values, &ctx).and_then(|v| {
             if desc.output.accepts(&v) {
                 Ok(v)
@@ -1448,6 +1600,12 @@ impl Evaluator<'_> {
                     self.attempt = enclosing_attempt;
                     return self.finish(node, Ok(v));
                 }
+                Err(e) if self.cancellation.is_cancelled() => {
+                    // Host cancellation is not a program-level failure: it is
+                    // neither retried nor handed to the catch block.
+                    self.attempt = enclosing_attempt;
+                    return self.finish(node, Err(e));
+                }
                 Err(e) => {
                     let retry = e.retryable && attempt < retries;
                     let retry_after = e.retry_after;
@@ -1459,8 +1617,9 @@ impl Evaluator<'_> {
                     // the next attempt, invisible to operation identity and
                     // the execution graph.
                     let delay = self.runtime.retry_delay(attempt + 1, retry_after);
-                    if !delay.is_zero() {
-                        std::thread::sleep(delay);
+                    if !delay.is_zero() && self.cancellation.sleep(delay) {
+                        self.attempt = enclosing_attempt;
+                        return self.finish(node, Err(cancelled_error()));
                     }
                 }
             }
@@ -1743,6 +1902,11 @@ impl Evaluator<'_> {
     }
 
     fn budget(&self) -> Result<(), ToolError> {
+        // Every node creation passes through here, so a cancelled run stops
+        // expanding within one node regardless of what it was evaluating.
+        if self.cancellation.is_cancelled() {
+            return Err(cancelled_error());
+        }
         if self.graph.node_count() >= self.runtime.max_graph_nodes {
             return Err(lang(
                 "RL4105",
@@ -1796,6 +1960,9 @@ impl Evaluator<'_> {
             worker_budget: self.worker_budget.clone(),
             after_gates: self.after_gates.clone(),
             lexical_scope: self.lexical_scope,
+            cancellation: self.cancellation.clone(),
+            #[cfg(feature = "tokio")]
+            tokio: self.tokio.clone(),
         }
     }
     fn finish(&mut self, node: usize, r: Result<V, ToolError>) -> Result<V, ToolError> {
@@ -1834,6 +2001,10 @@ fn path(e: &Expr) -> Option<String> {
 }
 fn lang(code: &str, msg: &str) -> ToolError {
     ToolError::new(code, msg)
+}
+/// Terminal error returned by a host-cancelled run.
+fn cancelled_error() -> ToolError {
+    lang("RL6110", "RUN_CANCELLED: the host cancelled this run")
 }
 /// Internal control signal for a taken `skip`; intercepted by the enclosing
 /// `for`/`fold` iteration and never observable by programs (the parser

@@ -145,6 +145,8 @@ pub enum ProgressOutcome {
     Succeeded,
     /// Run returned an error, including a rejected registry digest.
     Failed,
+    /// Run stopped because the host cancelled it (`RL6110`).
+    Cancelled,
 }
 
 /// One value-free mutation or run outcome.

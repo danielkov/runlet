@@ -319,6 +319,35 @@ impl Schema {
         }
     }
 
+    /// Lowers a JSON Schema document into Runlet's smaller schema vocabulary.
+    ///
+    /// The conversion is total and only ever *widens*: every JSON value the
+    /// source schema accepts is accepted by the result. It is intended for
+    /// adapting external tool catalogs (MCP `inputSchema`/`outputSchema`,
+    /// OpenAPI).
+    ///
+    /// - `type` (including type arrays and OpenAPI `nullable`), `enum`,
+    ///   `const`, `anyOf`/`oneOf`, `allOf`, and local `$ref`s are lowered, and
+    ///   keywords that appear together are intersected.
+    /// - Numeric `enum`/`const` values become their covering range.
+    /// - `number` becomes `integer | number`, because canonical values keep
+    ///   integral JSON numbers as integers.
+    /// - Tuples become a list over the union of their element schemas,
+    ///   length-bounded when extra elements are forbidden.
+    /// - `additionalProperties: false` closes an object; a schema-valued
+    ///   `additionalProperties` with no `properties` becomes a map.
+    /// - Property `description`s become [`Property::documentation`].
+    ///
+    /// Precision is lost, never soundness, in these cases:
+    ///
+    /// - A recursive `$ref` is expanded once and then cut with `Any`.
+    /// - Remote `$ref`s, `not`, and `if`/`then`/`else` become `Any`.
+    /// - `pattern`, `multipleOf`, `uniqueItems`, exclusive bounds on
+    ///   non-integers, and per-position tuple types are dropped.
+    pub fn from_json_schema(schema: &serde_json::Value) -> Self {
+        lower_json_schema(schema)
+    }
+
     /// Returns whether a canonical value satisfies this schema.
     pub fn accepts(&self, v: &CanonicalValue) -> bool {
         match (self, v) {
@@ -378,4 +407,460 @@ impl Schema {
             _ => false,
         }
     }
+}
+
+/// Nesting depth after which JSON Schema lowering widens to `Any`.
+const JSON_SCHEMA_DEPTH_LIMIT: usize = 64;
+
+type JsonObject = serde_json::Map<String, serde_json::Value>;
+
+struct JsonSchemaLowering<'a> {
+    root: &'a serde_json::Value,
+    /// Local references currently being expanded. Re-entering one is a
+    /// recursive schema, which Runlet cannot name, so the cycle is cut with
+    /// `Any` after a single expansion instead of unrolling it.
+    active_references: Vec<&'a str>,
+    depth: usize,
+}
+
+impl<'a> JsonSchemaLowering<'a> {
+    fn lower(&mut self, node: &'a serde_json::Value) -> Schema {
+        let serde_json::Value::Object(object) = node else {
+            return Schema::Any;
+        };
+        if self.depth >= JSON_SCHEMA_DEPTH_LIMIT {
+            return Schema::Any;
+        }
+        self.depth += 1;
+        let schema = self.lower_object(object);
+        self.depth -= 1;
+        schema
+    }
+
+    /// Every applicable keyword contributes one schema; a value must satisfy
+    /// all of them, so the result is their intersection.
+    fn lower_object(&mut self, object: &'a JsonObject) -> Schema {
+        use crate::analyzer::union;
+        use serde_json::Value as J;
+        let mut parts = vec![];
+        if let Some(constant) = object.get("const") {
+            parts.push(json_literal_schema(std::slice::from_ref(constant)));
+        }
+        if let Some(J::Array(values)) = object.get("enum") {
+            parts.push(json_literal_schema(values));
+        }
+        if let Some(J::String(reference)) = object.get("$ref") {
+            parts.push(self.reference(reference));
+        }
+        for keyword in ["anyOf", "oneOf"] {
+            if let Some(J::Array(variants)) = object.get(keyword) {
+                let variants = variants.iter().map(|v| self.lower(v)).collect();
+                parts.push(union(variants));
+            }
+        }
+        if let Some(J::Array(all)) = object.get("allOf") {
+            for member in all {
+                parts.push(self.lower(member));
+            }
+        }
+        parts.push(self.typed(object));
+        let schema = parts
+            .into_iter()
+            .reduce(intersect_schemas)
+            .unwrap_or(Schema::Any);
+        if object.get("nullable") == Some(&J::Bool(true)) {
+            union(vec![schema, Schema::Null])
+        } else {
+            schema
+        }
+    }
+
+    fn reference(&mut self, reference: &'a str) -> Schema {
+        let Some(target) = reference
+            .strip_prefix('#')
+            .and_then(|pointer| self.root.pointer(pointer))
+        else {
+            return Schema::Any;
+        };
+        if self.active_references.contains(&reference) {
+            return Schema::Any;
+        }
+        self.active_references.push(reference);
+        let schema = self.lower(target);
+        self.active_references.pop();
+        schema
+    }
+
+    /// Schema implied by `type`, or by structural keywords when it is absent.
+    fn typed(&mut self, object: &'a JsonObject) -> Schema {
+        use serde_json::Value as J;
+        match object.get("type") {
+            Some(J::String(name)) => self.by_type(name, object),
+            Some(J::Array(names)) => {
+                let variants = names
+                    .iter()
+                    .map(|name| match name.as_str() {
+                        Some(name) => self.by_type(name, object),
+                        None => Schema::Any,
+                    })
+                    .collect();
+                crate::analyzer::union(variants)
+            }
+            _ if ["properties", "required", "additionalProperties"]
+                .iter()
+                .any(|keyword| object.contains_key(*keyword)) =>
+            {
+                self.by_type("object", object)
+            }
+            _ if object.contains_key("items") || object.contains_key("prefixItems") => {
+                self.by_type("array", object)
+            }
+            _ => Schema::Any,
+        }
+    }
+
+    fn by_type(&mut self, name: &str, object: &'a JsonObject) -> Schema {
+        use serde_json::Value as J;
+        match name {
+            "null" => Schema::Null,
+            "boolean" => Schema::Boolean,
+            "integer" => {
+                // Exclusive integer bounds are exact as inclusive neighbours.
+                let exclusive = |keyword, step: i64| {
+                    object
+                        .get(keyword)
+                        .and_then(J::as_i64)
+                        .and_then(|bound| bound.checked_add(step))
+                };
+                let inclusive = |keyword| object.get(keyword).and_then(J::as_i64);
+                Schema::Integer {
+                    min: tighter(
+                        inclusive("minimum"),
+                        exclusive("exclusiveMinimum", 1),
+                        i64::max,
+                    ),
+                    max: tighter(
+                        inclusive("maximum"),
+                        exclusive("exclusiveMaximum", -1),
+                        i64::min,
+                    ),
+                }
+            }
+            // Canonical values keep integral JSON numbers as integers.
+            "number" => {
+                let bound = |keyword| object.get(keyword).and_then(J::as_f64);
+                crate::analyzer::union(vec![
+                    Schema::INTEGER,
+                    Schema::Number {
+                        min: tighter(bound("minimum"), bound("exclusiveMinimum"), f64::max),
+                        max: tighter(bound("maximum"), bound("exclusiveMaximum"), f64::min),
+                    },
+                ])
+            }
+            "string" => Schema::String {
+                format: object.get("format").and_then(J::as_str).map(str::to_owned),
+                enumeration: vec![],
+                min_len: json_usize(object.get("minLength")),
+                max_len: json_usize(object.get("maxLength")),
+            },
+            "array" => self.array(object),
+            "object" => self.object(object),
+            _ => Schema::Any,
+        }
+    }
+
+    /// Lists and tuples. A tuple lowers to a list over the union of its
+    /// positional and trailing element schemas, closed to the tuple's length
+    /// when it forbids extra elements.
+    fn array(&mut self, object: &'a JsonObject) -> Schema {
+        use serde_json::Value as J;
+        // 2020-12 tuples use `prefixItems` + `items`; earlier drafts use an
+        // array-valued `items` + `additionalItems`.
+        let (prefix, rest) = match (object.get("prefixItems"), object.get("items")) {
+            (Some(J::Array(prefix)), rest) => (Some(prefix), rest),
+            (_, Some(J::Array(prefix))) => (Some(prefix), object.get("additionalItems")),
+            (_, rest) => (None, rest),
+        };
+        let closed = rest == Some(&J::Bool(false));
+        let mut elements = vec![];
+        for element in prefix.into_iter().flatten() {
+            elements.push(self.lower(element));
+        }
+        if !closed {
+            elements.push(rest.map_or(Schema::Any, |rest| self.lower(rest)));
+        }
+        let max_items = json_usize(object.get("maxItems"));
+        Schema::List {
+            // A closed empty tuple has no elements to describe.
+            items: Box::new(crate::analyzer::union(elements)),
+            min_len: json_usize(object.get("minItems")),
+            max_len: match prefix {
+                Some(prefix) if closed => tighter(max_items, Some(prefix.len()), usize::min),
+                _ => max_items,
+            },
+        }
+    }
+
+    fn object(&mut self, object: &'a JsonObject) -> Schema {
+        use serde_json::Value as J;
+        let mut properties = BTreeMap::new();
+        if let Some(J::Object(declared)) = object.get("properties") {
+            for (name, schema) in declared {
+                let mut property = Property::new(self.lower(schema));
+                if let Some(text) = schema.get("description").and_then(J::as_str) {
+                    property.documentation = text.to_owned();
+                }
+                properties.insert(name.clone(), property);
+            }
+        }
+        let required: BTreeSet<String> = match object.get("required") {
+            Some(J::Array(names)) => names
+                .iter()
+                .filter_map(|name| name.as_str().map(str::to_owned))
+                .collect(),
+            _ => BTreeSet::new(),
+        };
+        let patterned = object.contains_key("patternProperties");
+        match object.get("additionalProperties") {
+            Some(values @ J::Object(_))
+                if properties.is_empty() && required.is_empty() && !patterned =>
+            {
+                Schema::Map {
+                    values: Box::new(self.lower(values)),
+                }
+            }
+            additional => Schema::Object {
+                properties,
+                required,
+                additional: patterned || additional != Some(&J::Bool(false)),
+            },
+        }
+    }
+}
+
+fn lower_json_schema(root: &serde_json::Value) -> Schema {
+    JsonSchemaLowering {
+        root,
+        active_references: vec![],
+        depth: 0,
+    }
+    .lower(root)
+}
+
+fn json_usize(value: Option<&serde_json::Value>) -> Option<usize> {
+    value?.as_u64()?.try_into().ok()
+}
+
+/// Combines two optional bounds, keeping the stricter when both are present.
+fn tighter<T>(a: Option<T>, b: Option<T>, pick: impl FnOnce(T, T) -> T) -> Option<T> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(pick(a, b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// Schema for a JSON Schema `enum`/`const` literal list: exact for strings,
+/// the covering range for numbers, and the kind for everything else.
+fn json_literal_schema(values: &[serde_json::Value]) -> Schema {
+    use serde_json::Value as J;
+    let mut strings = vec![];
+    let mut integers: Option<(i64, i64)> = None;
+    let mut numbers: Option<(f64, f64)> = None;
+    let mut others = vec![];
+    for value in values {
+        match value {
+            J::String(text) => {
+                if !strings.contains(text) {
+                    strings.push(text.clone());
+                }
+            }
+            J::Null => others.push(Schema::Null),
+            J::Bool(_) => others.push(Schema::Boolean),
+            J::Number(n) => match (n.as_i64(), n.as_f64()) {
+                (Some(i), _) => {
+                    let (low, high) = integers.unwrap_or((i, i));
+                    integers = Some((low.min(i), high.max(i)));
+                }
+                (None, Some(x)) => {
+                    let (low, high) = numbers.unwrap_or((x, x));
+                    numbers = Some((low.min(x), high.max(x)));
+                }
+                (None, None) => return Schema::Any,
+            },
+            J::Array(_) | J::Object(_) => return Schema::Any,
+        }
+    }
+    if let Some((min, max)) = integers {
+        others.push(Schema::Integer {
+            min: Some(min),
+            max: Some(max),
+        });
+    }
+    if let Some((min, max)) = numbers {
+        others.push(Schema::Number {
+            min: Some(min),
+            max: Some(max),
+        });
+    }
+    if !strings.is_empty() {
+        others.push(Schema::String {
+            format: None,
+            enumeration: strings,
+            min_len: None,
+            max_len: None,
+        });
+    }
+    crate::analyzer::union(others)
+}
+
+/// Schema accepted by both `a` and `b`, or a widening of it. Where the two
+/// cannot be combined structurally the result is `a`, which is always a
+/// valid widening of the intersection.
+fn intersect_schemas(a: Schema, b: Schema) -> Schema {
+    use Schema as S;
+    if a == b {
+        return a;
+    }
+    match (a, b) {
+        (S::Any, other) | (other, S::Any) => other,
+        (
+            S::Integer { min, max },
+            S::Integer {
+                min: other_min,
+                max: other_max,
+            },
+        ) => S::Integer {
+            min: tighter(min, other_min, i64::max),
+            max: tighter(max, other_max, i64::min),
+        },
+        (
+            S::Number { min, max },
+            S::Number {
+                min: other_min,
+                max: other_max,
+            },
+        ) => S::Number {
+            min: tighter(min, other_min, f64::max),
+            max: tighter(max, other_max, f64::min),
+        },
+        (
+            S::String {
+                format,
+                enumeration,
+                min_len,
+                max_len,
+            },
+            S::String {
+                format: other_format,
+                enumeration: other_enumeration,
+                min_len: other_min_len,
+                max_len: other_max_len,
+            },
+        ) => {
+            let common: Vec<String> = enumeration
+                .iter()
+                .filter(|value| other_enumeration.contains(value))
+                .cloned()
+                .collect();
+            S::String {
+                format: format.or(other_format),
+                // An empty enumeration means unrestricted, so a disjoint
+                // pair keeps the left side instead of becoming unrestricted.
+                enumeration: if enumeration.is_empty() {
+                    other_enumeration
+                } else if other_enumeration.is_empty() || common.is_empty() {
+                    enumeration
+                } else {
+                    common
+                },
+                min_len: tighter(min_len, other_min_len, usize::max),
+                max_len: tighter(max_len, other_max_len, usize::min),
+            }
+        }
+        (
+            S::List {
+                items,
+                min_len,
+                max_len,
+            },
+            S::List {
+                items: other_items,
+                min_len: other_min_len,
+                max_len: other_max_len,
+            },
+        ) => S::List {
+            items: Box::new(intersect_schemas(*items, *other_items)),
+            min_len: tighter(min_len, other_min_len, usize::max),
+            max_len: tighter(max_len, other_max_len, usize::min),
+        },
+        (
+            S::Object {
+                mut properties,
+                mut required,
+                additional,
+            },
+            S::Object {
+                properties: other_properties,
+                required: other_required,
+                additional: other_additional,
+            },
+        ) => {
+            for (name, other) in other_properties {
+                let merged = match properties.remove(&name) {
+                    Some(mut property) => {
+                        property.schema = intersect_schemas(property.schema, other.schema);
+                        if property.documentation.is_empty() {
+                            property.documentation = other.documentation;
+                        }
+                        property
+                    }
+                    None => other,
+                };
+                properties.insert(name, merged);
+            }
+            required.extend(other_required);
+            S::Object {
+                properties,
+                required,
+                additional: additional && other_additional,
+            }
+        }
+        (S::Union { variants, .. }, other) => {
+            let others = match &other {
+                S::Union { variants, .. } => variants.clone(),
+                single => vec![single.clone()],
+            };
+            let mut kept = vec![];
+            for variant in &variants {
+                for candidate in &others {
+                    if std::mem::discriminant(variant) == std::mem::discriminant(candidate) {
+                        kept.push(intersect_schemas(variant.clone(), candidate.clone()));
+                    } else if is_keyed(variant) && is_keyed(candidate) {
+                        // Objects and maps overlap but do not combine.
+                        kept.push(variant.clone());
+                    }
+                }
+            }
+            if kept.is_empty() {
+                S::Union {
+                    variants,
+                    discriminator: None,
+                }
+            } else {
+                crate::analyzer::union(kept)
+            }
+        }
+        (single, other @ S::Union { .. }) => {
+            match intersect_schemas(other, single.clone()) {
+                // No variant matched: the union came back unchanged.
+                S::Union { .. } => single,
+                narrowed => narrowed,
+            }
+        }
+        (a, _) => a,
+    }
+}
+
+fn is_keyed(schema: &Schema) -> bool {
+    matches!(schema, Schema::Object { .. } | Schema::Map { .. })
 }
