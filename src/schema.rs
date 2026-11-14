@@ -69,6 +69,14 @@ pub enum Schema {
     },
     /// Any canonical Runlet value.
     Any,
+    /// A named schema defined in the [`ToolRegistry`], the only way to
+    /// express a recursive shape such as a tree. A reference is resolved by
+    /// the registry that owns the definition, so checks that have no registry
+    /// (plain [`Schema::accepts`]) reject it.
+    Ref {
+        /// Definition name passed to [`ToolRegistry::define`].
+        name: String,
+    },
     /// The type of expressions that never produce a value (`fail(...)`).
     /// Never unifies with anything: a branch that fails contributes nothing
     /// to the surrounding schema. No runtime value has this schema.
@@ -181,6 +189,17 @@ pub struct ToolDescriptor {
 /// Deterministically ordered collection of tool descriptors.
 pub struct ToolRegistry {
     tools: BTreeMap<String, ToolDescriptor>,
+    definitions: BTreeMap<String, Schema>,
+}
+
+/// A JSON Schema lowered by [`Schema::from_json_schema_recursive`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct LoweredSchema {
+    /// Schema of the document root.
+    pub schema: Schema,
+    /// Recursive definitions `schema` refers to, keyed by reference name.
+    /// Register each with [`ToolRegistry::define`].
+    pub definitions: BTreeMap<String, Schema>,
 }
 
 impl ToolRegistry {
@@ -214,10 +233,99 @@ impl ToolRegistry {
             .filter_map(|n| n.split('.').next())
             .collect()
     }
-    /// Returns a deterministic hex digest of all descriptors.
+    /// Returns a deterministic hex digest of all descriptors and definitions.
     pub fn digest(&self) -> String {
-        let bytes = serde_json::to_vec(&self.tools).expect("serializable");
+        // Registries without definitions keep their pre-definition digest.
+        let bytes = if self.definitions.is_empty() {
+            serde_json::to_vec(&self.tools)
+        } else {
+            serde_json::to_vec(&(&self.tools, &self.definitions))
+        }
+        .expect("serializable");
         hex::encode(Sha256::digest(bytes))
+    }
+    /// Defines the schema that [`Schema::Ref`] `name` stands for.
+    ///
+    /// Definitions may refer to themselves and to each other, in any order.
+    /// Names are host-chosen and global to the registry, so adapters for
+    /// several catalogs should namespace them. [`Self::validate`] checks the
+    /// finished set.
+    pub fn define(&mut self, name: impl Into<String>, schema: Schema) -> Result<(), String> {
+        let name = name.into();
+        if self.definitions.contains_key(&name) {
+            return Err(format!("duplicate schema definition `{name}`"));
+        }
+        self.definitions.insert(name, schema);
+        Ok(())
+    }
+    /// Looks up a schema definition by name.
+    pub fn definition(&self, name: &str) -> Option<&Schema> {
+        self.definitions.get(name)
+    }
+    /// Checks that every reference in a tool or definition is defined and
+    /// that no definition is *unguarded*: reachable from itself through
+    /// references and unions alone (`a = a | null`), which describes no
+    /// finite value shape and could not be resolved.
+    pub fn validate(&self) -> Result<(), String> {
+        let mut dangling = None;
+        let mut check = |owner: &str, schema: &Schema| {
+            schema.each_reference(&mut |name| {
+                if dangling.is_none() && !self.definitions.contains_key(name) {
+                    dangling = Some(format!("{owner} refers to undefined schema `{name}`"));
+                }
+            })
+        };
+        for (name, tool) in &self.tools {
+            for schema in tool.input.parameters.iter().chain([&tool.output]) {
+                check(&format!("tool `{name}`"), schema);
+            }
+        }
+        for (name, schema) in &self.definitions {
+            check(&format!("schema definition `{name}`"), schema);
+        }
+        if let Some(error) = dangling {
+            return Err(error);
+        }
+        match unguarded_definition(&self.definitions) {
+            Some(name) => Err(format!(
+                "schema definition `{name}` refers to itself without an enclosing \
+                 list, map, or object"
+            )),
+            None => Ok(()),
+        }
+    }
+    /// Returns whether `value` satisfies `schema`, resolving references
+    /// against this registry's definitions.
+    pub fn accepts(&self, schema: &Schema, value: &CanonicalValue) -> bool {
+        schema.accepts_in(value, Some(&self.definitions))
+    }
+    /// Replaces a reference, or references among a union's variants, with
+    /// the schemas they stand for, so the result's outermost constructor is
+    /// structural. Nested references are left in place. Undefined and
+    /// unguarded references widen to `Any`.
+    pub(crate) fn head(&self, schema: Schema) -> Schema {
+        match schema {
+            Schema::Ref { .. } => {
+                let mut current = &schema;
+                // A guarded chain is shorter than the definition count.
+                for _ in 0..=self.definitions.len() {
+                    match current {
+                        Schema::Ref { name } => match self.definitions.get(name) {
+                            Some(definition) => current = definition,
+                            None => return Schema::Any,
+                        },
+                        other => return self.head(other.clone()),
+                    }
+                }
+                Schema::Any
+            }
+            Schema::Union { variants, .. }
+                if variants.iter().any(|v| matches!(v, Schema::Ref { .. })) =>
+            {
+                crate::analyzer::union(variants.into_iter().map(|v| self.head(v)).collect())
+            }
+            other => other,
+        }
     }
 }
 
@@ -297,6 +405,7 @@ impl Schema {
                 .map(|v| v.notation(depth + 1))
                 .collect::<Vec<_>>()
                 .join(" | "),
+            Self::Ref { name } => name.clone(),
             other => other.kind_name().to_string(),
         }
     }
@@ -316,6 +425,7 @@ impl Schema {
             Self::Object { .. } => "object",
             Self::Union { .. } => "union",
             Self::Never => "never",
+            Self::Ref { .. } => "reference",
         }
     }
 
@@ -340,7 +450,8 @@ impl Schema {
     ///
     /// Precision is lost, never soundness, in these cases:
     ///
-    /// - A recursive `$ref` is expanded once and then cut with `Any`.
+    /// - A recursive `$ref` is expanded once and then cut with `Any`; use
+    ///   [`Self::from_json_schema_recursive`] to keep it.
     /// - Remote `$ref`s, `not`, and `if`/`then`/`else` become `Any`.
     /// - `pattern`, `multipleOf`, `uniqueItems`, exclusive bounds on
     ///   non-integers, and per-position tuple types are dropped.
@@ -348,9 +459,66 @@ impl Schema {
         lower_json_schema(schema)
     }
 
+    /// Lowers a JSON Schema document like [`Self::from_json_schema`], but
+    /// keeps recursive local `$ref`s as [`Schema::Ref`]s instead of cutting
+    /// them with `Any`.
+    ///
+    /// Each recursive reference becomes a definition named
+    /// `{namespace}{reference}`, for example `crm.tree#/$defs/node`.
+    /// `namespace` must be unique per lowered document within one registry,
+    /// because definition names are registry-global. Non-recursive
+    /// references are still inlined. A self-reference with no enclosing
+    /// list, map, or object describes no value and is defined as `Any`.
+    pub fn from_json_schema_recursive(
+        schema: &serde_json::Value,
+        namespace: &str,
+    ) -> LoweredSchema {
+        let mut lowering = JsonSchemaLowering::new(schema, Some(namespace));
+        let schema = lowering.lower(schema);
+        let mut definitions = lowering.definitions;
+        while let Some(name) = unguarded_definition(&definitions) {
+            definitions.insert(name, Schema::Any);
+        }
+        LoweredSchema {
+            schema,
+            definitions,
+        }
+    }
+
+    /// Calls `visit` with the name of every reference in this schema.
+    fn each_reference(&self, visit: &mut impl FnMut(&str)) {
+        match self {
+            Self::Ref { name } => visit(name),
+            Self::List { items, .. } => items.each_reference(visit),
+            Self::Map { values } => values.each_reference(visit),
+            Self::Object { properties, .. } => properties
+                .values()
+                .for_each(|property| property.schema.each_reference(visit)),
+            Self::Union { variants, .. } => variants.iter().for_each(|v| v.each_reference(visit)),
+            _ => {}
+        }
+    }
+
     /// Returns whether a canonical value satisfies this schema.
+    ///
+    /// A [`Schema::Ref`] accepts nothing here, because it can only be
+    /// resolved by its registry; use [`ToolRegistry::accepts`] for schemas
+    /// that may contain references.
     pub fn accepts(&self, v: &CanonicalValue) -> bool {
+        self.accepts_in(v, None)
+    }
+
+    fn accepts_in(
+        &self,
+        v: &CanonicalValue,
+        definitions: Option<&BTreeMap<String, Schema>>,
+    ) -> bool {
         match (self, v) {
+            // Terminates on validated definitions: each resolution either
+            // descends into the finite value or follows a guarded chain.
+            (Self::Ref { name }, v) => definitions
+                .and_then(|definitions| definitions.get(name))
+                .is_some_and(|definition| definition.accepts_in(v, definitions)),
             (Self::Never, _) => false,
             (Self::Any, _) => true,
             (Self::Null, CanonicalValue::Null) => true,
@@ -385,7 +553,7 @@ impl Schema {
             ) => {
                 min_len.is_none_or(|m| xs.len() >= m)
                     && max_len.is_none_or(|m| xs.len() <= m)
-                    && xs.iter().all(|x| items.accepts(x))
+                    && xs.iter().all(|x| items.accepts_in(x, definitions))
             }
             (
                 Self::Object {
@@ -397,13 +565,18 @@ impl Schema {
             ) => {
                 required.iter().all(|k| o.contains_key(k))
                     && (*additional || o.keys().all(|k| properties.contains_key(k)))
-                    && o.iter()
-                        .all(|(k, v)| properties.get(k).is_none_or(|p| p.schema.accepts(v)))
+                    && o.iter().all(|(k, v)| {
+                        properties
+                            .get(k)
+                            .is_none_or(|p| p.schema.accepts_in(v, definitions))
+                    })
             }
             (Self::Map { values }, CanonicalValue::Object(o)) => {
-                o.values().all(|v| values.accepts(v))
+                o.values().all(|v| values.accepts_in(v, definitions))
             }
-            (Self::Union { variants, .. }, v) => variants.iter().any(|s| s.accepts(v)),
+            (Self::Union { variants, .. }, v) => {
+                variants.iter().any(|s| s.accepts_in(v, definitions))
+            }
             _ => false,
         }
     }
@@ -421,9 +594,25 @@ struct JsonSchemaLowering<'a> {
     /// `Any` after a single expansion instead of unrolling it.
     active_references: Vec<&'a str>,
     depth: usize,
+    /// Prefix for definition names; `None` cuts recursion with `Any`.
+    namespace: Option<&'a str>,
+    /// Active references that were re-entered and so need a definition.
+    recursive: BTreeSet<&'a str>,
+    definitions: BTreeMap<String, Schema>,
 }
 
 impl<'a> JsonSchemaLowering<'a> {
+    fn new(root: &'a serde_json::Value, namespace: Option<&'a str>) -> Self {
+        Self {
+            root,
+            active_references: vec![],
+            depth: 0,
+            namespace,
+            recursive: BTreeSet::new(),
+            definitions: BTreeMap::new(),
+        }
+    }
+
     fn lower(&mut self, node: &'a serde_json::Value) -> Schema {
         let serde_json::Value::Object(object) = node else {
             return Schema::Any;
@@ -482,13 +671,34 @@ impl<'a> JsonSchemaLowering<'a> {
         else {
             return Schema::Any;
         };
+        let Some(namespace) = self.namespace else {
+            if self.active_references.contains(&reference) {
+                return Schema::Any;
+            }
+            self.active_references.push(reference);
+            let schema = self.lower(target);
+            self.active_references.pop();
+            return schema;
+        };
+        let name = format!("{namespace}{reference}");
+        if self.definitions.contains_key(&name) {
+            return Schema::Ref { name };
+        }
         if self.active_references.contains(&reference) {
-            return Schema::Any;
+            self.recursive.insert(reference);
+            return Schema::Ref { name };
         }
         self.active_references.push(reference);
         let schema = self.lower(target);
         self.active_references.pop();
-        schema
+        // Only references that turned out to be recursive are named; the
+        // rest stay inlined so ordinary schemas lower exactly as before.
+        if self.recursive.remove(reference) {
+            self.definitions.insert(name.clone(), schema);
+            Schema::Ref { name }
+        } else {
+            schema
+        }
     }
 
     /// Schema implied by `type`, or by structural keywords when it is absent.
@@ -639,12 +849,40 @@ impl<'a> JsonSchemaLowering<'a> {
 }
 
 fn lower_json_schema(root: &serde_json::Value) -> Schema {
-    JsonSchemaLowering {
-        root,
-        active_references: vec![],
-        depth: 0,
+    JsonSchemaLowering::new(root, None).lower(root)
+}
+
+/// Name of a definition reachable from itself through references and union
+/// variants alone, if any. Such a definition has no structural constructor
+/// to bound resolution.
+fn unguarded_definition(definitions: &BTreeMap<String, Schema>) -> Option<String> {
+    fn exposed<'a>(schema: &'a Schema, out: &mut Vec<&'a str>) {
+        match schema {
+            Schema::Ref { name } => out.push(name),
+            Schema::Union { variants, .. } => variants.iter().for_each(|v| exposed(v, out)),
+            _ => {}
+        }
     }
-    .lower(root)
+    for start in definitions.keys() {
+        let mut seen = BTreeSet::new();
+        let mut pending = vec![start.as_str()];
+        while let Some(name) = pending.pop() {
+            let Some(definition) = definitions.get(name) else {
+                continue;
+            };
+            let mut next = vec![];
+            exposed(definition, &mut next);
+            for name in next {
+                if name == start {
+                    return Some(start.clone());
+                }
+                if seen.insert(name) {
+                    pending.push(name);
+                }
+            }
+        }
+    }
+    None
 }
 
 fn json_usize(value: Option<&serde_json::Value>) -> Option<usize> {
@@ -835,8 +1073,7 @@ fn intersect_schemas(a: Schema, b: Schema) -> Schema {
                 for candidate in &others {
                     if std::mem::discriminant(variant) == std::mem::discriminant(candidate) {
                         kept.push(intersect_schemas(variant.clone(), candidate.clone()));
-                    } else if is_keyed(variant) && is_keyed(candidate) {
-                        // Objects and maps overlap but do not combine.
+                    } else if overlap_without_combining(variant, candidate) {
                         kept.push(variant.clone());
                     }
                 }
@@ -861,6 +1098,10 @@ fn intersect_schemas(a: Schema, b: Schema) -> Schema {
     }
 }
 
-fn is_keyed(schema: &Schema) -> bool {
-    matches!(schema, Schema::Object { .. } | Schema::Map { .. })
+/// Different kinds that can still share values: objects with maps, and a
+/// reference with anything, since its shape is not known here.
+fn overlap_without_combining(a: &Schema, b: &Schema) -> bool {
+    let keyed = |schema: &Schema| matches!(schema, Schema::Object { .. } | Schema::Map { .. });
+    let reference = |schema: &Schema| matches!(schema, Schema::Ref { .. });
+    (keyed(a) && keyed(b)) || reference(a) || reference(b)
 }

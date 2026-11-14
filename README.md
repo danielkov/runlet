@@ -286,6 +286,24 @@ assert!(input.accepts(&argument));
 let wire: serde_json::Value = argument.to_json()?;
 ```
 
+Recursive shapes such as trees are expressed with `Schema::Ref`, which names a
+definition held by the registry. `Schema::from_json_schema_recursive` produces
+them from recursive `$ref`s instead of cutting the cycle with `Any`:
+
+```rust
+let lowered = Schema::from_json_schema_recursive(&json_schema, "crm.tree.output");
+for (name, schema) in lowered.definitions {
+    registry.define(name, schema)?; // e.g. `crm.tree.output#/$defs/node`
+}
+// `lowered.schema` is the tool's input or output schema.
+```
+
+Definition names are global to a registry, so give each lowered document its
+own namespace. References are structural: two definitions with the same shape
+are interchangeable, so a value returned by one tool can be passed to another
+that declares its own copy of the type. Use `ToolRegistry::accepts` rather than
+`Schema::accepts` to validate values against schemas that contain references.
+
 `CompiledProgram::referenced_tools` lists every registered callable the source
 invokes, including calls in branches that may never run. Check permissions or
 credentials against it after `compile` and before `run`, so a program is

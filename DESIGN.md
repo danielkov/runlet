@@ -442,8 +442,10 @@ The portable schema vocabulary is deliberately smaller than full JSON Schema:
 Null | Boolean | Integer{min,max} | Number{min,max}
 String{format,enum,min_len,max_len} | Bytes
 List{items,min_len,max_len} | Object{properties,required,additional}
-Map{values} | Union{variants,discriminator?} | Any
+Map{values} | Union{variants,discriminator?} | Any | Ref{name}
 ```
+
+`Ref{name}` stands for a schema the registry defines under that name, and is the only way to express a recursive shape. Definitions are registry-global, may refer to one another in any order, and are part of the registry digest. A definition must be *guarded*: it may not reach itself through references and union variants alone, so every cycle passes through a list, map, or object and resolution always terminates. References are structural, not nominal: two definitions with the same shape are the same type, and the analyzer compares them coinductively, assuming a pair of schemas compatible while that same pair is being checked.
 
 Properties may include documentation, examples, secret/sensitive marks, deprecation metadata, and aliases used only for diagnostics. Recursive schemas are allowed through registry-local references but MUST have a finite serialization representation. Tools SHOULD prefer discriminated unions.
 

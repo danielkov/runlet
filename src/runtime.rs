@@ -549,6 +549,7 @@ impl RuntimeBuilder {
     }
     /// Validates the registry, handlers, and inputs, then builds the runtime.
     pub fn build(self) -> Result<Runtime, String> {
+        self.runtime.registry.validate()?;
         for n in self.runtime.registry.names() {
             if !self.runtime.handlers.contains_key(n) {
                 return Err(format!("registered tool `{n}` has no implementation"));
@@ -560,7 +561,7 @@ impl RuntimeBuilder {
             }
         }
         for (n, (s, v)) in &self.runtime.inputs {
-            if !s.accepts(v) {
+            if !self.runtime.registry.accepts(s, v) {
                 return Err(format!("input `{n}` does not match its schema"));
             }
         }
@@ -1350,7 +1351,7 @@ impl Evaluator<'_> {
         #[cfg(feature = "tokio")]
         let _reactor = self.tokio.as_ref().map(tokio::runtime::Handle::enter);
         let mut r = handler(&values, &ctx).and_then(|v| {
-            if desc.output.accepts(&v) {
+            if self.runtime.registry.accepts(&desc.output, &v) {
                 Ok(v)
             } else {
                 Err(lang("RL6103", "TOOL_OUTPUT_SCHEMA_MISMATCH"))
@@ -1415,11 +1416,11 @@ impl Evaluator<'_> {
         self.finish(node, out)
     }
     fn convert(&mut self, span: Span, value: V, expected: &Schema) -> Result<V, ToolError> {
-        if expected.accepts(&value) {
+        if self.runtime.registry.accepts(expected, &value) {
             return Ok(value);
         }
         let node = self.node(NodeKind::Convert, "convert", span)?;
-        let result = convert_value(value, expected);
+        let result = convert_value(value, expected, &self.runtime.registry);
         self.finish(node, result)
     }
     fn loop_expr(
@@ -2202,11 +2203,19 @@ fn computed_key(v: V) -> Result<String, ToolError> {
         )),
     }
 }
-fn convert_value(value: V, expected: &Schema) -> Result<V, ToolError> {
-    if expected.accepts(&value) {
+fn convert_value(value: V, expected: &Schema, registry: &ToolRegistry) -> Result<V, ToolError> {
+    if registry.accepts(expected, &value) {
         return Ok(value);
     }
     match (value, expected) {
+        // Resolution follows the finite value, so recursion terminates.
+        (value, Schema::Ref { name }) => match registry.definition(name) {
+            Some(definition) => convert_value(value, definition, registry),
+            None => Err(lang(
+                "RL8106",
+                &format!("schema definition `{name}` is not registered"),
+            )),
+        },
         (V::Integer(x), Schema::Number { .. }) => {
             V::number(exact(x)?).map_err(|_| lang("RL5103", "NON_FINITE_NUMBER"))
         }
@@ -2216,7 +2225,7 @@ fn convert_value(value: V, expected: &Schema) -> Result<V, ToolError> {
         ) => Ok(V::String(format_value(&v)?)),
         (V::List(values), Schema::List { items, .. }) => values
             .into_iter()
-            .map(|v| convert_value(v, items))
+            .map(|v| convert_value(v, items, registry))
             .collect::<Result<Vec<_>, _>>()
             .map(V::List),
         (
@@ -2252,11 +2261,11 @@ fn convert_value(value: V, expected: &Schema) -> Result<V, ToolError> {
                         // "omit the key", matching JSON null-as-absent.
                         if matches!(value, V::Null)
                             && !required.contains(&key)
-                            && !property.schema.accepts(&V::Null)
+                            && !registry.accepts(&property.schema, &V::Null)
                         {
                             continue;
                         }
-                        out.insert(key, convert_value(value, &property.schema)?);
+                        out.insert(key, convert_value(value, &property.schema, registry)?);
                     }
                     None if *additional => {
                         out.insert(key, value);
@@ -2274,7 +2283,7 @@ fn convert_value(value: V, expected: &Schema) -> Result<V, ToolError> {
         (value, Schema::Union { variants, .. }) => {
             let converted = variants
                 .iter()
-                .filter_map(|schema| convert_value(value.clone(), schema).ok())
+                .filter_map(|schema| convert_value(value.clone(), schema, registry).ok())
                 .collect::<Vec<_>>();
             if converted.len() == 1 {
                 Ok(converted.into_iter().next().unwrap())
@@ -2318,6 +2327,7 @@ fn schema_kind(s: &Schema) -> &'static str {
         Schema::Object { .. } => "object",
         Schema::Union { .. } => "union",
         Schema::Never => "never",
+        Schema::Ref { .. } => "reference",
     }
 }
 fn error_value(e: &ToolError, attempt: u32) -> V {

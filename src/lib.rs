@@ -45,7 +45,9 @@ pub use progress::{
     ProgressReceiver, ProgressRecvError, ProgressSender, ProgressState, progress_channel,
 };
 pub use runtime::{Execution, RunOptions, Runtime, RuntimeBuilder, ToolContext, ToolError};
-pub use schema::{CallSchema, ExecutionPolicy, Property, Schema, ToolDescriptor, ToolRegistry};
+pub use schema::{
+    CallSchema, ExecutionPolicy, LoweredSchema, Property, Schema, ToolDescriptor, ToolRegistry,
+};
 pub use syntax::{BinaryOp, Block, Expr, ExprKind, ObjectKey, Program, Stmt, StmtKind, UnaryOp};
 pub use value::{CanonicalValue, ValueError};
 
